@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f2f50" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>ورود | آریاک</title>
+    <link rel="stylesheet" href="/login/style.css" />
+  </head>
+  <body>
+    <main class="login-shell">
+      <div class="shell-watermark" aria-hidden="true"></div>
+      <section class="login-card" aria-labelledby="login-title">
+        <div class="login-brand">
+          <img class="brand-watermark" src="/login/ariak-logo.svg" alt="" aria-hidden="true" />
+          <div class="logo-panel"><img src="/login/ariak-logo.svg" alt="لوگوی آریاک" /></div>
+          <p class="brand-eyebrow">سامانهٔ یکپارچهٔ نرم‌افزاری آریاک</p>
+          <div class="brand-lines" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+        </div>
+        <div class="login-form-panel">
+          <div class="secure-badge"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 19 6v5c0 4.7-2.9 8-7 10-4.1-2-7-5.3-7-10V6l7-3Z"/><path d="m9 12 2 2 4-4"/></svg><span>ورود امن</span></div>
+          <h1 id="login-title">خوش آمدید</h1>
+          <p class="intro">برای ورود به فضای کاری خود، اطلاعات حساب را وارد کنید.</p>
+          <form id="login-form" autocomplete="on">
+            <label for="username">نام کاربری</label>
+            <div class="input-wrap">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+              <input id="username" name="username" type="text" autocomplete="username" required autofocus />
+            </div>
+            <label for="password">رمز عبور</label>
+            <div class="input-wrap">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3m-4 5v2"/></svg>
+              <input id="password" name="password" type="password" autocomplete="current-password" required />
+              <button class="password-toggle" type="button" aria-label="نمایش رمز عبور" title="نمایش رمز عبور">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+            <p id="login-error" class="login-error" role="alert" aria-live="polite"></p>
+            <button id="login-submit" class="submit-button" type="submit">ورود به سامانه <span aria-hidden="true">←</span></button>
+          </form>
+          <p class="login-footnote"><span class="lock-dot" aria-hidden="true"></span>دسترسی فقط برای کاربران مجاز است.</p>
+        </div>
+      </section>
+    </main>
+    <script src="/login/login.js" defer></script>
+  </body>
+</html>

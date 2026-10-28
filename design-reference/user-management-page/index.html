@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f8fb">
+  <title>مدیریت کاربران | سامانه مانیتورینگ اعلام حریق</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 2.8 20 6v5.5c0 5-3.3 8.3-8 10.1-4.7-1.8-8-5.1-8-10.1V6l8-3.2Z"/><path d="M8.5 12.1 10.8 14.4 15.7 9.5"/></svg></div>
+        <div><strong>فایر مانیتور</strong><small>مدیریت و مانیتورینگ اعلام حریق</small></div>
+      </div>
+      <div class="sidebar-section-label">منوی اصلی</div>
+      <nav class="navigation" aria-label="منوی اصلی">
+        <button class="nav-item" data-nav="dashboard"><span class="nav-icon" data-icon="grid"></span><span>نمای کلی</span></button>
+        <button class="nav-item" data-nav="projects"><span class="nav-icon" data-icon="building"></span><span>پروژه‌ها</span></button>
+        <button class="nav-item" data-nav="panels"><span class="nav-icon" data-icon="panel"></span><span>پنل‌ها</span></button>
+        <button class="nav-item" data-nav="floorplan"><span class="nav-icon" data-icon="map"></span><span>نقشه و چیدمان</span></button>
+        <button class="nav-item" data-nav="events"><span class="nav-icon" data-icon="bell"></span><span>رویدادهای تجهیزات</span><span class="nav-count">۲</span></button>
+        <button class="nav-item" data-nav="reports"><span class="nav-icon" data-icon="chart"></span><span>گزارش‌ها</span></button>
+        <button class="nav-item" data-nav="devices"><span class="nav-icon" data-icon="radio"></span><span>دستگاه‌های ESP</span></button>
+      </nav>
+      <div class="sidebar-section-label sidebar-section-spaced">مدیریت سامانه</div>
+      <nav class="navigation" aria-label="مدیریت سامانه">
+        <button class="nav-item active" data-nav="users"><span class="nav-icon" data-icon="users"></span><span>مدیریت کاربران</span></button>
+        <button class="nav-item" data-nav="activity"><span class="nav-icon" data-icon="history"></span><span>گزارش فعالیت</span></button>
+        <button class="nav-item" data-nav="settings"><span class="nav-icon" data-icon="settings"></span><span>تنظیمات سامانه</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="connection-dot"></div>
+        <div><strong>نسخه نمایشی</strong><small>اطلاعات نمونه · بدون اتصال به پنل واقعی</small></div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="topbar-start">
+          <button class="icon-button mobile-menu" id="mobileMenu" aria-label="باز کردن منو"><span data-icon="menu"></span></button>
+          <div class="breadcrumbs"><span>سامانه</span><span class="crumb-separator">/</span><strong id="breadcrumbCurrent">مدیریت کاربران</strong></div>
+        </div>
+        <div class="topbar-actions">
+          <div class="system-status"><span class="status-dot"></span><span>سامانه نمونه</span></div>
+          <button class="icon-button" id="helpButton" aria-label="راهنما" title="راهنما"><span data-icon="help"></span></button>
+          <div class="account-menu"><div class="avatar avatar-small">م</div><div class="account-text"><strong>مدیر سامانه</strong><small>admin.demo</small></div><span class="chevron" data-icon="chevron-down"></span></div>
+        </div>
+      </header>
+
+      <div class="content-area" id="contentArea">
+        <section class="page-view" id="usersPage">
+          <div class="page-heading">
+            <div><div class="eyebrow">مدیریت سامانه</div><h1>مدیریت کاربران</h1><p>حساب‌های کاربری، پروژه‌های اختصاص‌یافته و دسترسی به پنل‌های اعلام حریق را مدیریت کنید.</p></div>
+            <button class="btn btn-primary" id="addUserButton"><span data-icon="plus"></span> افزودن کاربر</button>
+          </div>
+          <div class="stat-grid stat-grid-two">
+            <article class="stat-card"><div class="stat-icon blue" data-icon="users"></div><div class="stat-copy"><span>کل کاربران</span><strong id="totalUsers">۴</strong><small>تمام حساب‌های ثبت‌شده</small></div></article>
+            <article class="stat-card"><div class="stat-icon green" data-icon="user-check"></div><div class="stat-copy"><span>حساب‌های فعال</span><strong id="activeUsers">۲</strong><small>قابل ورود به سامانه</small></div></article>
+          </div>
+
+          <section class="panel-card filter-card" aria-label="جست‌وجو و فیلتر کاربران">
+            <div class="filter-heading"><div><h2>فهرست کاربران</h2><p>جست‌وجو و فیلتر حساب‌ها بر اساس وضعیت یا پروژه</p></div><span class="results-count" id="resultCount">۴ کاربر</span></div>
+            <div class="filter-controls">
+              <label class="search-control"><span data-icon="search"></span><input id="userSearch" type="search" placeholder="جست‌وجو بر اساس نام، نام کاربری یا ایمیل…" autocomplete="off"></label>
+              <label class="select-control"><span class="field-label">وضعیت حساب</span><select id="statusFilter"><option value="all">همه وضعیت‌ها</option><option value="active">فعال</option><option value="invited">در انتظار فعال‌سازی</option><option value="disabled">غیرفعال</option></select></label>
+              <label class="select-control"><span class="field-label">پروژه</span><select id="projectFilter"><option value="all">همه پروژه‌ها</option></select></label>
+              <button class="btn btn-ghost filter-reset" id="resetFilters"><span data-icon="filter-x"></span> پاک‌کردن فیلترها</button>
+            </div>
+            <div class="table-wrap" id="usersTableWrap">
+              <table class="data-table">
+                <thead><tr><th>کاربر</th><th>وضعیت حساب</th><th>پروژه‌ها</th><th>پنل‌های مجاز</th><th>اختیارات مدیریتی</th><th>آخرین فعالیت</th><th class="actions-column">عملیات</th></tr></thead>
+                <tbody id="usersTableBody"></tbody>
+              </table>
+            </div>
+            <div class="empty-state hidden" id="usersEmpty"><div class="empty-icon" data-icon="search-x"></div><h3>کاربری پیدا نشد</h3><p>عبارت جست‌وجو یا فیلترها را تغییر دهید.</p><button class="btn btn-secondary" id="emptyReset">پاک‌کردن فیلترها</button></div>
+            <div class="table-footer"><span id="tableSummary">نمایش ۴ کاربر</span><span class="demo-note"><span data-icon="info"></span> داده‌های این صفحه نمونه هستند.</span></div>
+          </section>
+        </section>
+
+        <section class="page-view hidden" id="userDetailPage"></section>
+        <section class="page-view hidden" id="accessPage"></section>
+        <section class="page-view hidden" id="activityPage"></section>
+        <section class="page-view hidden" id="placeholderPage"></section>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+  <div class="modal-backdrop hidden" id="modalBackdrop">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" id="modalContent"></section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
