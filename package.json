@@ -11,11 +11,20 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node server/index.js",
+    "test": "node --test src/dip-address.test.js src/router.test.js src/workspace-store.test.js server/user-auth.test.js server/panel-settings.test.js server/http-security.test.js server/workspace-repository.test.js server/logger.test.js shared/domain-constraints.test.js",
     "test:dip-address": "node --test src/dip-address.test.js",
-    "check": "node --check src/main.js && node --check src/user-management.js && node --check server/index.js && node --check server/user-auth.js && node --check server/panel-settings.js && node --check server/create-admin.js",
+    "check": "node --check src/main.js && node --check src/demo-data.js && node --check src/api-client.js && node --check src/router.js && node --check src/workspace-store.js && node --check src/format.js && node --check src/user-management.js && node --check src/floor-plan.js && node --check src/activity-report.js && node --check server/index.js && node --check server/user-auth.js && node --check server/panel-settings.js && node --check server/http-security.js && node --check server/workspace-repository.js && node --check server/logger.js && node --check shared/domain-constraints.js",
+    "lint": "eslint .",
+    "format:check": "prettier --check eslint.config.js ecosystem.config.cjs server/http-security.js server/logger.js server/workspace-repository.js shared/domain-constraints.js src/api-client.js src/router.js src/workspace-store.js src/format.js src/demo-data.js",
     "test:user-auth": "node --test server/user-auth.test.js server/panel-settings.test.js"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.10",
+    "sharp": "^0.35.5",
+    "svgo": "^4.1.0",
     "vite": "^8.1.5"
   },
   "dependencies": {
@@ -23,11 +32,12 @@
     "@pdf-lib/fontkit": "^1.1.1",
     "@resvg/resvg-js": "^2.6.2",
     "arabic-persian-reshaper": "^1.0.1",
-    "bidi-js": "^1.1.0",
+    "compression": "^1.8.2",
     "cors": "^2.8.6",
     "dotenv": "^18.0.2",
     "express": "^5.2.1",
-    "fabric": "^6.9.1",
+    "fabric": "^7.4.0",
+    "helmet": "^8.3.0",
     "multer": "^2.4.0",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.10.38",
@@ -35,5 +45,8 @@
   },
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
+  },
+  "overrides": {
+    "tar": "7.5.22"
   }
 }

@@ -1,10 +1,13 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import compression from "compression";
 import pg from "pg";
 import path from "node:path";
 import { existsSync, readFileSync, mkdirSync, createReadStream, unlinkSync, statSync } from "node:fs";
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   GLOBAL_PERMISSIONS, PROJECT_PERMISSIONS,
   hashPassword, hashSessionToken, hasGlobalPermission, hasProjectPermission,
@@ -12,9 +15,13 @@ import {
   sessionCookie, validPassword, validUsername, verifyPassword, writeAudit,
 } from "./user-auth.js";
 import { PANEL_SETTING_KEYS, redactPanelSecrets, sanitizeWorkspaceForUser, validatePanelSettings } from "./panel-settings.js";
+import { findLoopCardLimitViolation } from "../shared/domain-constraints.js";
+import { csrfCookie, csrfTokenMatches, readCookie, setSecurityHeaders, CSRF_HEADER_NAME } from "./http-security.js";
+import { loadWorkspaceProjects, migrateLegacyWorkspace, saveWorkspaceProjects, splitProject } from "./workspace-repository.js";
+import { createLogger } from "./logger.js";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
-import { PDFDocument, StandardFonts, rgb, degrees } from "pdf-lib";
+import { PDFDocument, rgb, degrees } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import { Resvg } from "@resvg/resvg-js";
 import reshaper from "arabic-persian-reshaper";
@@ -26,20 +33,35 @@ const workspaceKey = process.env.WORKSPACE_KEY || "monitoring-system";
 const currentFile = fileURLToPath(import.meta.url);
 const serverDirectory = path.dirname(currentFile);
 const projectDirectory = path.resolve(serverDirectory, "..");
+const defaultDataDirectory = path.resolve(projectDirectory, "..", `${path.basename(projectDirectory)}-data`);
+const dataDirectory = path.resolve(process.env.MONITORING_DATA_DIR || defaultDataDirectory);
+const logDirectory = path.resolve(process.env.MONITORING_LOG_DIR || path.join(dataDirectory, "logs"));
+const logger = createLogger(logDirectory);
+const requestContext = new AsyncLocalStorage();
+function logServerError(label, error, level = "error") {
+  const event = label.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.+|\.+$/g, "");
+  const errorName = error instanceof Error ? error.name : "Error";
+  const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : undefined;
+  const requestId = requestContext.getStore()?.requestId;
+  logger[level](event, { ...(requestId ? { requestId } : {}), errorName, ...(errorCode ? { errorCode } : {}) });
+}
 const distDirectory = path.join(projectDirectory, "dist");
 const distIndex = path.join(distDirectory, "index.html");
 const deviceSchemaPath = path.join(serverDirectory, "device-schema.sql");
 const floorPlanSchemaPath = path.join(serverDirectory, "floor-plan-schema.sql");
 const userAuthSchemaPath = path.join(serverDirectory, "user-auth-schema.sql");
 const appStateSchemaPath = path.join(serverDirectory, "schema.sql");
-const floorPlanUploadDirectory = path.join(projectDirectory, "uploads", "plans");
+const floorPlanUploadDirectory = path.join(dataDirectory, "plans");
 const deviceIconDirectory = path.join(projectDirectory, "public", "icons");
 // pdf-lib's fontkit embedding needs the WOFF font, not the browser-oriented WOFF2 subset.
 // Use a single font with both Arabic and Latin glyphs so mixed Persian labels
 // (for example, "آدرس: 3") stay in one correctly ordered text run.
 const pdfLabelFontPath = process.env.FLOOR_PLAN_PDF_FONT || path.join(process.env.WINDIR || "C:/Windows", "Fonts", "tahoma.ttf");
 const configuredOrigins = (process.env.CORS_ORIGIN || "").split(",").map((origin) => origin.trim()).filter(Boolean);
-const corsOptions = configuredOrigins.length ? { origin: (origin, callback) => callback(null, !origin || configuredOrigins.includes(origin)) } : undefined;
+const corsOptions = {
+  origin: (origin, callback) => callback(null, Boolean(origin && configuredOrigins.includes(origin))),
+  optionsSuccessStatus: 204,
+};
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || undefined,
@@ -54,19 +76,40 @@ const pool = new Pool({
   connectionTimeoutMillis: 5_000,
 });
 
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
 app.disable("x-powered-by");
 // Trust only a local reverse proxy (such as the bundled Nginx config) for client IP headers.
 app.set("trust proxy", "loopback");
+app.use(helmet({
+  contentSecurityPolicy: { directives: {
+    defaultSrc: ["'self'"], baseUri: ["'self'"], connectSrc: ["'self'"], fontSrc: ["'self'", "data:"],
+    formAction: ["'self'"], frameAncestors: ["'none'"], imgSrc: ["'self'", "data:", "blob:"],
+    objectSrc: ["'none'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], workerSrc: ["'self'", "blob:"],
+    ...(process.env.NODE_ENV === "production" ? { upgradeInsecureRequests: [] } : {}),
+  } },
+  crossOriginEmbedderPolicy: false,
+  hsts: process.env.NODE_ENV === "production" ? { maxAge: 31_536_000, includeSubDomains: true } : false,
+}));
+app.use(setSecurityHeaders);
+app.use(compression());
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/esp/")) return next();
   return cors(corsOptions)(req, res, next);
 });
 app.use((req, res, next) => {
   const startedAt = Date.now();
+  const requestId = randomUUID();
+  req.requestId = requestId;
+  res.setHeader("X-Request-Id", requestId);
   res.on("finish", () => {
-    console.log(`${req.ip} ${req.method} ${req.path} ${res.statusCode} ${Date.now() - startedAt}ms`);
+    logger.info("http.request", { requestId, method: req.method, path: req.path, statusCode: res.statusCode, durationMs: Date.now() - startedAt });
   });
-  next();
+  requestContext.run({ requestId }, next);
 });
 // Project images can be large; device and admin APIs only need small JSON bodies.
 app.use((req, res, next) => {
@@ -74,7 +117,9 @@ app.use((req, res, next) => {
   return express.json({ limit: isDeviceApi ? "16kb" : "25mb" })(req, res, next);
 });
 
-const siteLoginAttempts = new Map();
+const LOGIN_FAILURE_LIMIT = 5;
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+let loginRateLimitSweepCount = 0;
 const DEVICE_ONLINE_WINDOW_SECONDS = 45;
 const DEVICE_COMMAND_TTL_SECONDS = 90;
 let deviceSchemaPromise;
@@ -99,7 +144,7 @@ function ensureUserAuthSchema() {
                    FROM jsonb_array_elements(payload#>'{state,savedSettingFiles}') item),'[]'::jsonb),
          TRUE
        ) WHERE jsonb_typeof(payload#>'{state,savedSettingFiles}')='array'`,
-    )).catch((error) => {
+    )).then(() => migrateLegacyWorkspace(pool, workspaceKey)).catch((error) => {
       userAuthSchemaPromise = null;
       throw error;
     });
@@ -152,9 +197,74 @@ function requireSameOrigin(req, res, next) {
   return next();
 }
 
+function isLocalDevelopmentRequest(req) {
+  if (["development", "test"].includes(process.env.NODE_ENV)) return true;
+  if (process.env.NODE_ENV === "production") return false;
+  return ["localhost", "127.0.0.1", "::1"].includes(String(req.hostname || "").toLowerCase());
+}
+
+function readExpectedRevision(req) {
+  const value = String(req.get("if-match") || "").trim();
+  const match = /^(?:W\/)?"(?:(?:workspace|panel)-)?(\d+)"$/.exec(value);
+  return match ? Number(match[1]) : null;
+}
+
+function setWorkspaceRevision(res, revision) {
+  res.set("ETag", `"workspace-${revision}"`);
+  res.set("Cache-Control", "no-store");
+}
+
 function requireHttps(req, res, next) {
-  if (process.env.NODE_ENV === "production" && !req.secure) return res.status(426).json({ ok: false, error: "HTTPS is required" });
+  if (!req.secure && !isLocalDevelopmentRequest(req)) return res.status(426).json({ ok: false, error: "HTTPS is required" });
   return next();
+}
+
+function csrfCookieName(req) {
+  return req.secure || process.env.NODE_ENV === "production" ? "__Host-monitoring_csrf" : "monitoring_csrf";
+}
+
+async function isLoginBlocked(ip) {
+  const result = await pool.query(
+    "SELECT blocked_until > NOW() AS blocked FROM app_login_rate_limits WHERE ip_hash=$1",
+    [hashSessionToken(ip || "unknown")],
+  );
+  return Boolean(result.rows[0]?.blocked);
+}
+
+async function recordLoginFailure(ip) {
+  const key = hashSessionToken(ip || "unknown");
+  const client = await pool.connect();
+  let blocked;
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "INSERT INTO app_login_rate_limits(ip_hash,failure_count,window_expires_at) VALUES($1,0,NOW()+INTERVAL '15 minutes') ON CONFLICT(ip_hash) DO NOTHING",
+      [key],
+    );
+    const row = await client.query("SELECT failure_count,window_expires_at,blocked_until FROM app_login_rate_limits WHERE ip_hash=$1 FOR UPDATE", [key]);
+    const current = row.rows[0];
+    const expired = new Date(current.window_expires_at).getTime() <= Date.now();
+    const failureCount = expired ? 1 : current.failure_count + 1;
+    const blockedUntil = failureCount >= LOGIN_FAILURE_LIMIT ? new Date(Date.now() + LOGIN_FAILURE_WINDOW_MS) : null;
+    await client.query(
+      "UPDATE app_login_rate_limits SET failure_count=$2,window_expires_at=$3,blocked_until=$4,updated_at=NOW() WHERE ip_hash=$1",
+      [key, failureCount, expired ? new Date(Date.now() + LOGIN_FAILURE_WINDOW_MS) : current.window_expires_at, blockedUntil],
+    );
+    await client.query("COMMIT");
+    blocked = failureCount >= LOGIN_FAILURE_LIMIT;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally { client.release(); }
+  loginRateLimitSweepCount += 1;
+  if (loginRateLimitSweepCount % 100 === 0) {
+    void pool.query("DELETE FROM app_login_rate_limits WHERE window_expires_at < NOW() AND (blocked_until IS NULL OR blocked_until < NOW())").catch(() => {});
+  }
+  return blocked;
+}
+
+async function clearLoginFailures(ip) {
+  await pool.query("DELETE FROM app_login_rate_limits WHERE ip_hash=$1", [hashSessionToken(ip || "unknown")]);
 }
 
 app.get("/api/site/session", async (req, res) => {
@@ -169,20 +279,18 @@ app.get("/api/site/session", async (req, res) => {
     await pool.query("UPDATE app_sessions SET expires_at=NOW()+INTERVAL '8 hours',last_seen_at=NOW() WHERE token_hash=$1", [hashSessionToken(token)]);
     return res.json({ authenticated: true, user: { id: user.id, username: user.username, displayName: user.displayName, mustChangePassword: user.mustChangePassword } });
   } catch (error) {
-    console.error("User session lookup error:", error);
+    logServerError("User session lookup error:", error);
     return res.status(503).json({ authenticated: false, error: "Authentication service temporarily unavailable" });
   }
 });
 
 app.post("/api/site/login", requireHttps, requireSameOrigin, async (req, res) => {
   const ip = req.ip || "unknown";
-  const now = Date.now();
-  const attempt = siteLoginAttempts.get(ip);
-  if (attempt?.blockedUntil > now) return res.status(429).json({ ok: false, error: "Too many login attempts; try again later" });
   const username = typeof req.body?.username === "string" ? req.body.username : "";
   const password = typeof req.body?.password === "string" ? req.body.password : "";
   try {
     await ensureUserAuthSchema();
+    if (await isLoginBlocked(ip)) return res.status(429).json({ ok: false, error: "Too many login attempts; try again later" });
     const result = await pool.query("SELECT id,password_hash,is_active FROM app_users WHERE username_normalized=$1", [normalizeUsername(username)]);
     const user = result.rows[0];
     const valid = user?.is_active
@@ -190,22 +298,22 @@ app.post("/api/site/login", requireHttps, requireSameOrigin, async (req, res) =>
       : await verifyPassword(password || "invalid-password", await dummyPasswordHashPromise);
     if (!user?.is_active || !valid) {
       await writeAudit(pool, { action: "auth.login_failed", outcome: "failure", details: { username: username.trim().slice(0, 64) } }).catch(() => {});
-      const next = !attempt || attempt.resetAt <= now ? { count: 1, resetAt: now + 15 * 60 * 1000 } : { ...attempt, count: attempt.count + 1 };
-      if (next.count >= 5) next.blockedUntil = now + 15 * 60 * 1000;
-      siteLoginAttempts.set(ip, next);
-      return res.status(next.blockedUntil ? 429 : 401).json({ ok: false, error: "نام کاربری یا رمز عبور اشتباه است." });
+      const blocked = await recordLoginFailure(ip);
+      return res.status(blocked ? 429 : 401).json({ ok: false, error: "نام کاربری یا رمز عبور اشتباه است." });
     }
-    siteLoginAttempts.delete(ip);
+    await clearLoginFailures(ip);
     const token = newSessionToken();
+    const csrfToken = newSessionToken();
     const tokenHash = hashSessionToken(token);
-    await pool.query("INSERT INTO app_sessions(token_hash,user_id,expires_at) VALUES($1,$2,NOW()+INTERVAL '8 hours')", [tokenHash, user.id]);
+    await pool.query("INSERT INTO app_sessions(token_hash,user_id,csrf_token_hash,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '8 hours')", [tokenHash, user.id, hashSessionToken(csrfToken)]);
     await pool.query("UPDATE app_users SET last_login_at=NOW() WHERE id=$1", [user.id]);
     await writeAudit(pool, { actorId: user.id, targetId: user.id, action: "auth.login" });
-    res.set("Set-Cookie", sessionCookie(token, req.secure || process.env.NODE_ENV === "production"));
+    const secureCookie = req.secure || process.env.NODE_ENV === "production";
+    res.set("Set-Cookie", [sessionCookie(token, secureCookie), csrfCookie(csrfToken, secureCookie)]);
     res.set("Cache-Control", "no-store");
     return res.json({ ok: true });
   } catch (error) {
-    console.error("User login error:", error);
+    logServerError("User login error:", error);
     return res.status(503).json({ ok: false, error: "Authentication service temporarily unavailable" });
   }
 });
@@ -218,20 +326,30 @@ app.post("/api/site/logout", requireHttps, requireSameOrigin, async (req, res) =
       const result = await pool.query("DELETE FROM app_sessions WHERE token_hash=$1 RETURNING user_id", [hashSessionToken(token)]);
       if (result.rowCount) await writeAudit(pool, { actorId: result.rows[0].user_id, targetId: result.rows[0].user_id, action: "auth.logout" });
     }
-  } catch (error) { console.error("User logout error:", error); }
-  res.set("Set-Cookie", sessionCookie("", req.secure || process.env.NODE_ENV === "production", 0));
+  } catch (error) { logServerError("User logout error:", error); }
+  const secureCookie = req.secure || process.env.NODE_ENV === "production";
+  res.set("Set-Cookie", [
+    sessionCookie("", secureCookie, 0),
+    csrfCookie("", secureCookie, 0),
+    "monitoring_csrf=; Path=/; SameSite=Strict; Max-Age=0",
+    "__Host-monitoring_csrf=; Path=/; SameSite=Strict; Max-Age=0; Secure",
+  ]);
   return res.json({ ok: true });
 });
 
 app.use(async (req, res, next) => {
-  if (["/api/site/session", "/api/site/login", "/api/site/logout", "/api/health"].includes(req.path) || req.path.startsWith("/api/esp/")) return next();
+  if (["/api/site/session", "/api/site/login", "/api/site/logout", "/api/health", "/api/health/live", "/api/health/ready"].includes(req.path) || req.path.startsWith("/api/esp/")) return next();
   try {
     await ensureUserAuthSchema();
     const token = readSessionCookie(req);
     let user = null;
     if (token) {
-      const session = await pool.query("SELECT user_id FROM app_sessions WHERE token_hash=$1 AND expires_at>NOW()", [hashSessionToken(token)]);
-      if (session.rowCount) user = await loadUserById(pool, session.rows[0].user_id);
+      const session = await pool.query("SELECT user_id,csrf_token_hash FROM app_sessions WHERE token_hash=$1 AND expires_at>NOW()", [hashSessionToken(token)]);
+      if (session.rowCount) {
+        req.sessionTokenHash = hashSessionToken(token);
+        req.csrfTokenHash = session.rows[0].csrf_token_hash || "";
+        user = await loadUserById(pool, session.rows[0].user_id);
+      }
       if (!user?.isActive) {
         await pool.query("DELETE FROM app_sessions WHERE token_hash=$1", [hashSessionToken(token)]);
         user = null;
@@ -249,7 +367,7 @@ app.use(async (req, res, next) => {
     if (req.path.startsWith("/api/")) return res.status(401).json({ ok: false, error: "Login required" });
     return res.redirect(302, "/login?next=" + encodeURIComponent(req.originalUrl));
   } catch (error) {
-    console.error("Human authentication middleware error:", error);
+    logServerError("Human authentication middleware error:", error);
     if (req.path.startsWith("/api/")) return res.status(503).json({ ok: false, error: "Authentication service temporarily unavailable" });
     return res.status(503).send("Authentication service temporarily unavailable");
   }
@@ -259,6 +377,9 @@ app.use(async (req, res, next) => {
 // APIs use bearer credentials and are intentionally exempt from browser CSRF checks.
 app.use((req, res, next) => {
   if (!req.path.startsWith("/api/") || req.path.startsWith("/api/esp/") || ["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  if (!csrfTokenMatches(req.get(CSRF_HEADER_NAME), readCookie(req, csrfCookieName(req)), req.csrfTokenHash)) {
+    return res.status(403).json({ ok: false, error: "Valid CSRF token required" });
+  }
   return requireSameOrigin(req, res, next);
 });
 
@@ -283,9 +404,7 @@ const requireAuditRead = (req, res, next) => {
 };
 
 async function getWorkspaceProjects() {
-  const result = await pool.query("SELECT payload FROM app_state WHERE workspace_key=$1", [workspaceKey]);
-  const items = result.rows[0]?.payload?.projects;
-  return Array.isArray(items) ? items : [];
+  return loadWorkspaceProjects(pool, workspaceKey);
 }
 
 function canAccessProject(user, projectId) {
@@ -322,13 +441,27 @@ async function requireManagedDevice(req, res, next) {
     req.managedDeviceProjectId = result.rows[0].project_id;
     return next();
   } catch (error) {
-    console.error("Device authorization error:", error);
+    logServerError("Device authorization error:", error);
     return sendDeviceDatabaseError(res);
   }
 }
 
 app.get("/api/auth/me", async (req, res) => {
   return res.json({ ok: true, user: { id: req.user.id, username: req.user.username, displayName: req.user.displayName, mustChangePassword: req.user.mustChangePassword, globalPermissions: req.user.globalPermissions, projectPanels: req.user.projectPanels, projectPermissions: req.user.projectPermissions } });
+});
+
+app.get("/api/auth/csrf", async (req, res) => {
+  const name = csrfCookieName(req);
+  let token = readCookie(req, name);
+  if (!csrfTokenMatches(token, token, req.csrfTokenHash)) {
+    token = newSessionToken();
+    const tokenHash = hashSessionToken(token);
+    await pool.query("UPDATE app_sessions SET csrf_token_hash=$1 WHERE token_hash=$2", [tokenHash, req.sessionTokenHash]);
+    req.csrfTokenHash = tokenHash;
+    res.append("Set-Cookie", csrfCookie(token, req.secure || process.env.NODE_ENV === "production"));
+  }
+  res.set("Cache-Control", "no-store");
+  return res.json({ ok: true, csrfToken: token });
 });
 
 app.post("/api/auth/password", requireHttps, requireSameOrigin, async (req, res) => {
@@ -344,7 +477,7 @@ app.post("/api/auth/password", requireHttps, requireSameOrigin, async (req, res)
     await pool.query("DELETE FROM app_sessions WHERE user_id=$1 AND token_hash<>$2", [req.user.id, hashSessionToken(token)]);
     await writeAudit(pool, { actorId: req.user.id, targetId: req.user.id, action: "user.password_changed" });
     return res.json({ ok: true });
-  } catch (error) { console.error("Password change error:", error); return res.status(503).json({ ok: false, error: "Could not change password" }); }
+  } catch (error) { logServerError("Password change error:", error); return res.status(503).json({ ok: false, error: "Could not change password" }); }
 });
 
 app.get("/api/users", requireUserReadOrProjectManager, async (req, res) => {
@@ -365,7 +498,7 @@ app.get("/api/users", requireUserReadOrProjectManager, async (req, res) => {
       [scoped, managedIds],
     );
     return res.json({ ok: true, users: result.rows });
-  } catch (error) { console.error("User list error:", error); return res.status(503).json({ ok: false, error: "Could not load users" }); }
+  } catch (error) { logServerError("User list error:", error); return res.status(503).json({ ok: false, error: "Could not load users" }); }
 });
 
 app.post("/api/users", requireHttps, requireSameOrigin, requireUserPermission("users:manage"), async (req, res) => {
@@ -386,7 +519,7 @@ app.post("/api/users", requireHttps, requireSameOrigin, requireUserPermission("u
     return res.status(201).json({ ok: true, user: result.rows[0] });
   } catch (error) {
     if (error.code === "23505") return res.status(409).json({ ok: false, error: "Username is already in use" });
-    console.error("User create error:", error); return res.status(503).json({ ok: false, error: "Could not create user" });
+    logServerError("User create error:", error); return res.status(503).json({ ok: false, error: "Could not create user" });
   }
 });
 
@@ -395,7 +528,7 @@ app.get("/api/users/:id", requireUserPermission("users:read"), async (req, res) 
     const user = await loadUserById(pool, req.params.id);
     if (!user) return res.sendStatus(404);
     return res.json({ ok: true, user });
-  } catch (error) { console.error("User detail error:", error); return res.status(503).json({ ok: false, error: "Could not load user" }); }
+  } catch (error) { logServerError("User detail error:", error); return res.status(503).json({ ok: false, error: "Could not load user" }); }
 });
 
 app.patch("/api/users/:id", requireHttps, requireSameOrigin, requireUserPermission("users:manage"), async (req, res) => {
@@ -408,7 +541,7 @@ app.patch("/api/users/:id", requireHttps, requireSameOrigin, requireUserPermissi
     if (!result.rowCount) return res.sendStatus(404);
     await writeAudit(pool, { actorId: req.user.id, targetId: req.params.id, action: "user.updated", details: { displayName, email, phone } });
     return res.json({ ok: true });
-  } catch (error) { console.error("User update error:", error); return res.status(503).json({ ok: false, error: "Could not update user" }); }
+  } catch (error) { logServerError("User update error:", error); return res.status(503).json({ ok: false, error: "Could not update user" }); }
 });
 
 app.patch("/api/users/:id/status", requireHttps, requireSameOrigin, requireUserPermission("users:manage"), async (req, res) => {
@@ -432,7 +565,7 @@ app.patch("/api/users/:id/status", requireHttps, requireSameOrigin, requireUserP
     await client.query(`INSERT INTO app_audit_log(actor_user_id,target_user_id,action,details) VALUES($1,$2,$3,$4::jsonb)`, [req.user.id, req.params.id, req.body.isActive ? "user.activated" : "user.deactivated", JSON.stringify({ isActive: req.body.isActive })]);
     await client.query("COMMIT");
     return res.json({ ok: true });
-  } catch (error) { await client.query("ROLLBACK").catch(() => {}); console.error("User status error:", error); return res.status(503).json({ ok: false, error: "Could not update account status" }); }
+  } catch (error) { await client.query("ROLLBACK").catch(() => {}); logServerError("User status error:", error); return res.status(503).json({ ok: false, error: "Could not update account status" }); }
   finally { client.release(); }
 });
 
@@ -446,7 +579,7 @@ app.post("/api/users/:id/password-reset", requireHttps, requireSameOrigin, requi
     await pool.query("DELETE FROM app_sessions WHERE user_id=$1", [req.params.id]);
     await writeAudit(pool, { actorId: req.user.id, targetId: req.params.id, action: "user.password_reset" });
     return res.json({ ok: true });
-  } catch (error) { console.error("Password reset error:", error); return res.status(503).json({ ok: false, error: "Could not reset password" }); }
+  } catch (error) { logServerError("Password reset error:", error); return res.status(503).json({ ok: false, error: "Could not reset password" }); }
 });
 
 app.get("/api/users/:id/access", requireUserReadOrProjectManager, async (req, res) => {
@@ -457,7 +590,7 @@ app.get("/api/users/:id/access", requireUserReadOrProjectManager, async (req, re
     const globalReader = hasGlobalPermission(req.user, "users:read") || hasGlobalPermission(req.user, "users:manage") || hasGlobalPermission(req.user, "*");
     const visible = projects.filter((project) => globalReader || hasProjectPermission(req.user, project.id, "project:manage"));
     return res.json({ ok: true, projects: visible.map((project) => ({ projectId: project.id, projectName: project.name, isActive: Object.hasOwn(user.projectPanels || {}, project.id) || Object.hasOwn(user.projectPermissions || {}, project.id), panelIds: user.projectPanels?.[project.id] || [], panels: (project.panels || []).map((panel) => ({ id: panel.id, name: panel.name, allowed: hasGlobalPermission(user, "panels:all") || hasGlobalPermission(user, "*") || (user.projectPanels?.[project.id] || []).includes(panel.id) })), permissions: user.projectPermissions?.[project.id] || [] })), globalPermissions: globalReader ? user.globalPermissions : [] });
-  } catch (error) { console.error("User access read error:", error); return res.status(503).json({ ok: false, error: "Could not load access" }); }
+  } catch (error) { logServerError("User access read error:", error); return res.status(503).json({ ok: false, error: "Could not load access" }); }
 });
 
 app.put("/api/users/:id/access", requireHttps, requireSameOrigin, requireUserManageOrProjectManager, async (req, res) => {
@@ -514,7 +647,7 @@ app.put("/api/users/:id/access", requireHttps, requireSameOrigin, requireUserMan
       return res.json({ ok: true });
     } catch (error) { await client.query("ROLLBACK").catch(() => {}); throw error; }
     finally { client.release(); }
-  } catch (error) { console.error("User access save error:", error); return res.status(503).json({ ok: false, error: "Could not save access" }); }
+  } catch (error) { logServerError("User access save error:", error); return res.status(503).json({ ok: false, error: "Could not save access" }); }
 });
 
 app.get("/api/audit", requireAuditRead, async (req, res) => {
@@ -575,7 +708,7 @@ app.get("/api/audit", requireAuditRead, async (req, res) => {
     const events = rows.rows.map((event) => { const project = projectById.get(String(event.projectId)); const panel = project?.panels?.find((p) => String(p.id) === String(event.panelId)); return { ...event, projectName: project?.name || null, panelName: panel?.name || null }; });
     const filterProjects = visibleProjects.map((project) => ({ id: project.id, name: project.name, panels: (project.panels || []).map((panel) => ({ id: panel.id, name: panel.name })) }));
     return res.json({ ok: true, events, total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)), summary: { total, failedLogins: countResult.rows[0].failedLogins, accessChanges: countResult.rows[0].accessChanges, panelOperations: countResult.rows[0].panelOperations }, filters: { projects: filterProjects, users: filterUsers.rows } });
-  } catch (error) { console.error("Audit list error:", error); return res.status(503).json({ ok: false, error: "Could not load activity" }); }
+  } catch (error) { logServerError("Audit list error:", error); return res.status(503).json({ ok: false, error: "Could not load activity" }); }
 });
 
 const sendDeviceDatabaseError = (res) => res.status(503).json({ ok: false, error: "Device service temporarily unavailable" });
@@ -597,7 +730,7 @@ async function authenticateDevice(req, res, next) {
     req.espDevice = device;
     return next();
   } catch (error) {
-    console.error("ESP device authentication error:", error);
+    logServerError("ESP device authentication error:", error);
     return sendDeviceDatabaseError(res);
   }
 }
@@ -622,7 +755,7 @@ app.post("/api/talk/pairing", requireHttps, requireSameOrigin, requireDeviceAdmi
     res.set("Cache-Control", "no-store");
     return res.status(201).json({ ok: true, provisioningCode: code, expiresInSeconds: 600 });
   } catch (error) {
-    console.error("ESP pairing token creation error:", error);
+    logServerError("ESP pairing token creation error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -640,7 +773,7 @@ app.get("/api/talk/devices", requireDeviceAdmin, async (req, res) => {
     res.set("Cache-Control", "no-store");
     return res.json({ ok: true, devices: result.rows.filter((device) => canManageDevices(req.user, device.projectId)) });
   } catch (error) {
-    console.error("ESP device listing error:", error);
+    logServerError("ESP device listing error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -657,7 +790,7 @@ app.delete("/api/talk/devices/:deviceId", requireHttps, requireSameOrigin, requi
     await writeAudit(pool, { actorId: req.user.id, action: "device.revoked", projectId: req.managedDeviceProjectId, details: { deviceId: req.params.deviceId } });
     return res.json({ ok: true });
   } catch (error) {
-    console.error("ESP device revocation error:", error);
+    logServerError("ESP device revocation error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -683,7 +816,7 @@ app.post("/api/talk/devices/:deviceId/commands", requireHttps, requireSameOrigin
     await writeAudit(pool, { actorId: req.user.id, action: "device.command_queued", projectId: req.managedDeviceProjectId, details: { deviceId: req.params.deviceId, command } });
     return res.status(201).json({ ok: true, command: result.rows[0] });
   } catch (error) {
-    console.error("ESP command enqueue error:", error);
+    logServerError("ESP command enqueue error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -700,7 +833,7 @@ app.get("/api/talk/devices/:deviceId/commands", requireDeviceAdmin, requireManag
     );
     return res.json({ ok: true, commands: result.rows });
   } catch (error) {
-    console.error("ESP command history error:", error);
+    logServerError("ESP command history error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -717,7 +850,7 @@ app.get("/api/talk/devices/:deviceId/messages", requireDeviceAdmin, requireManag
     );
     return res.json({ ok: true, messages: result.rows.reverse() });
   } catch (error) {
-    console.error("ESP chat history error:", error);
+    logServerError("ESP chat history error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -745,7 +878,7 @@ app.delete("/api/talk/devices/:deviceId/commands/history", requireHttps, require
     return res.json({ ok: true, removedCommands: commands.rowCount });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("ESP command history clear error:", error);
+    logServerError("ESP command history clear error:", error);
     return sendDeviceDatabaseError(res);
   } finally {
     client.release();
@@ -774,7 +907,7 @@ app.delete("/api/talk/devices/:deviceId/messages", requireHttps, requireSameOrig
     return res.json({ ok: true, removedMessages: messages.rowCount });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("ESP chat clear error:", error);
+    logServerError("ESP chat clear error:", error);
     return sendDeviceDatabaseError(res);
   } finally {
     client.release();
@@ -800,7 +933,7 @@ app.post("/api/talk/devices/:deviceId/messages", requireHttps, requireSameOrigin
     await writeAudit(pool, { actorId: req.user.id, action: "device.message_queued", projectId: req.managedDeviceProjectId, details: { deviceId: req.params.deviceId } });
     return res.status(201).json({ ok: true, message: result.rows[0] });
   } catch (error) {
-    console.error("ESP chat enqueue error:", error);
+    logServerError("ESP chat enqueue error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -850,7 +983,7 @@ app.post("/api/esp/v1/provision", requireHttps, async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     if (error.code === "23505") return res.status(409).json({ ok: false, error: "Device ID is already registered" });
-    console.error("ESP provisioning error:", error);
+    logServerError("ESP provisioning error:", error);
     return sendDeviceDatabaseError(res);
   } finally {
     client.release();
@@ -871,7 +1004,7 @@ app.post("/api/esp/v1/heartbeat", requireHttps, authenticateDevice, async (req, 
     );
     return res.json({ ok: true, serverTime: new Date().toISOString(), pollIntervalSeconds: 2 });
   } catch (error) {
-    console.error("ESP heartbeat error:", error);
+    logServerError("ESP heartbeat error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -891,7 +1024,7 @@ app.get("/api/esp/v1/commands/next", requireHttps, authenticateDevice, async (re
     );
     return res.json({ ok: true, command: result.rows[0] || null, serverTime: new Date().toISOString() });
   } catch (error) {
-    console.error("ESP command poll error:", error);
+    logServerError("ESP command poll error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -912,7 +1045,7 @@ app.get("/api/esp/v1/chat/next", requireHttps, authenticateDevice, async (req, r
     return res.json({ ok: true, message: result.rows[0] || null });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("ESP chat poll error:", error);
+    logServerError("ESP chat poll error:", error);
     return sendDeviceDatabaseError(res);
   } finally {
     client.release();
@@ -934,7 +1067,7 @@ app.post("/api/esp/v1/chat", requireHttps, authenticateDevice, async (req, res) 
     );
     return res.status(201).json({ ok: true, accepted: true, duplicate: !result.rowCount });
   } catch (error) {
-    console.error("ESP chat send error:", error);
+    logServerError("ESP chat send error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -955,7 +1088,7 @@ app.post("/api/esp/v1/commands/:commandId/result", requireHttps, authenticateDev
     if (!result.rowCount) return res.status(409).json({ ok: false, error: "Command is unknown, expired, or already completed" });
     return res.json({ ok: true, commandId: req.params.commandId });
   } catch (error) {
-    console.error("ESP command result error:", error);
+    logServerError("ESP command result error:", error);
     return sendDeviceDatabaseError(res);
   }
 });
@@ -978,7 +1111,7 @@ app.post("/api/floor-plans", floorPlanUpload.single("pdf"), async (req, res) => 
       document = await PDFDocument.load(bytes, { ignoreEncryption: false });
     } catch (error) {
       unlinkSync(file.path);
-      console.warn("Floor plan PDF could not be parsed:", error.message);
+      logServerError("Floor plan PDF could not be parsed:", error, "warn");
       return res.status(400).json({ ok: false, error: "The uploaded file is not a readable PDF" });
     }
     const pages = document.getPages();
@@ -991,7 +1124,7 @@ app.post("/api/floor-plans", floorPlanUpload.single("pdf"), async (req, res) => 
     return res.status(201).json({ ok: true, plan: { id, name, projectId, pageCount: pages.length, width, height } });
   } catch (error) {
     if (existsSync(file.path)) unlinkSync(file.path);
-    console.error("Floor plan upload error:", error);
+    logServerError("Floor plan upload error:", error);
     return res.status(503).json({ ok: false, error: "Floor plan service temporarily unavailable" });
   }
 });
@@ -1002,7 +1135,7 @@ app.get("/api/floor-plans", async (req, res) => {
     const result = await pool.query("SELECT id,name,project_id AS \"projectId\",page_count AS \"pageCount\",width,height,created_at AS \"createdAt\" FROM floor_plans ORDER BY created_at DESC");
     return res.json({ ok: true, plans: result.rows.filter((plan) => canAccessProject(req.user, plan.projectId)) });
   } catch (error) {
-    console.error("Floor plan list error:", error);
+    logServerError("Floor plan list error:", error);
     return res.status(503).json({ ok: false, error: "Floor plan service temporarily unavailable" });
   }
 });
@@ -1017,7 +1150,7 @@ app.get("/api/floor-plans/:id/file", async (req, res) => {
     res.set({ "Content-Type": "application/pdf", "Content-Length": String(statSync(pdfPath).size), "Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff" });
     return createReadStream(pdfPath).pipe(res);
   } catch (error) {
-    console.error("Floor plan PDF read error:", error);
+    logServerError("Floor plan PDF read error:", error);
     return res.status(503).json({ ok: false, error: "Floor plan service temporarily unavailable" });
   }
 });
@@ -1036,7 +1169,7 @@ app.post("/api/floor-plans/:id/project", async (req, res) => {
     if (existing.rows[0].projectId !== projectId) return res.status(409).json({ ok: false, error: "The project assigned to a floor plan cannot be changed" });
     return res.json({ ok: true, projectId });
   } catch (error) {
-    console.error("Floor plan project assignment error:", error);
+    logServerError("Floor plan project assignment error:", error);
     return res.status(503).json({ ok: false, error: "Floor plan service temporarily unavailable" });
   }
 });
@@ -1060,7 +1193,7 @@ app.delete("/api/floor-plans/:id", async (req, res) => {
     if (existsSync(pdfPath)) unlinkSync(pdfPath);
     return res.json({ ok: true, id: deleted.rows[0].id });
   } catch (error) {
-    console.error("Floor plan delete error:", error);
+    logServerError("Floor plan delete error:", error);
     return res.status(503).json({ ok: false, error: "Floor plan service temporarily unavailable" });
   }
 });
@@ -1081,7 +1214,7 @@ app.get("/api/floor-plans/:id/layout", async (req, res) => {
       .filter((device) => canAccessPanel(req.user, plan.rows[0].projectId, device.panelId));
     return res.json({ ok: true, devices });
   } catch (error) {
-    console.error("Floor plan layout read error:", error);
+    logServerError("Floor plan layout read error:", error);
     return res.status(503).json({ ok: false, error: "Floor plan service temporarily unavailable" });
   }
 });
@@ -1137,7 +1270,7 @@ app.post("/api/floor-plans/:id/layout", async (req, res) => {
     return res.json({ ok: true, count: normalized.length });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Floor plan layout save error:", error);
+    logServerError("Floor plan layout save error:", error);
     return res.status(503).json({ ok: false, error: "Floor plan service temporarily unavailable" });
   } finally { client.release(); }
 });
@@ -1241,26 +1374,31 @@ app.get("/api/floor-plans/:id/export", async (req, res) => {
     res.set({ "Content-Type": "application/pdf", "Content-Disposition": `attachment; filename="${filename}"`, "X-Content-Type-Options": "nosniff" });
     return res.send(Buffer.from(bytes));
   } catch (error) {
-    console.error("Floor plan export error:", error);
+    logServerError("Floor plan export error:", error);
     return res.status(500).json({ ok: false, error: "Could not export this floor plan" });
   }
 });
 
-app.get("/api/health", async (_req, res) => {
+app.get("/api/health/live", (_req, res) => res.json({ ok: true, status: "live" }));
+
+const readinessHandler = async (_req, res) => {
   try {
     const result = await pool.query("SELECT NOW() AS database_time");
-    res.json({ ok: true, database: "connected", databaseTime: result.rows[0].database_time });
+    res.json({ ok: true, status: "ready", database: "connected", databaseTime: result.rows[0].database_time });
   } catch (error) {
-    res.status(503).json({ ok: false, database: "unavailable", error: process.env.NODE_ENV === "production" ? "Database unavailable" : error.message });
+    res.status(503).json({ ok: false, status: "not-ready", database: "unavailable", error: process.env.NODE_ENV === "production" ? "Database unavailable" : error.message });
   }
-});
+};
+app.get("/api/health/ready", readinessHandler);
+app.get("/api/health", readinessHandler);
 
 async function findWorkspacePanel(client, projectId, panelId, lock = false) {
-  const result = await client.query(`SELECT payload FROM app_state WHERE workspace_key=$1${lock ? " FOR UPDATE" : ""}`, [workspaceKey]);
-  const projects = Array.isArray(result.rows[0]?.payload?.projects) ? result.rows[0].payload.projects : [];
-  const project = projects.find((item) => String(item?.id) === projectId);
-  const panel = project?.panels?.find((item) => String(item?.id) === panelId);
-  return { exists: Boolean(project && panel), project, panel, payload: result.rows[0]?.payload || null };
+  const projectResult = await client.query(`SELECT project_data FROM app_projects WHERE workspace_key=$1 AND project_id=$2${lock ? " FOR UPDATE" : ""}`, [workspaceKey, projectId]);
+  const panelResult = await client.query(`SELECT panel_data FROM app_project_panels WHERE workspace_key=$1 AND project_id=$2 AND panel_id=$3${lock ? " FOR UPDATE" : ""}`, [workspaceKey, projectId, panelId]);
+  const stateResult = await client.query("SELECT payload FROM app_state WHERE workspace_key=$1", [workspaceKey]);
+  const project = projectResult.rows[0] ? { ...projectResult.rows[0].project_data, id: projectId } : null;
+  const panel = panelResult.rows[0]?.panel_data || null;
+  return { exists: Boolean(project && panel), project, panel, payload: stateResult.rows[0]?.payload || null };
 }
 
 function panelFilesFor(files, panelId) {
@@ -1268,7 +1406,7 @@ function panelFilesFor(files, panelId) {
 }
 
 async function getPanelSettings(client, projectId, panelId, actorId) {
-  const existing = await client.query("SELECT settings,saved_setting_files,updated_at FROM app_panel_settings WHERE project_id=$1 AND panel_id=$2", [projectId, panelId]);
+  const existing = await client.query("SELECT settings,saved_setting_files,updated_at,revision FROM app_panel_settings WHERE project_id=$1 AND panel_id=$2", [projectId, panelId]);
   if (existing.rowCount) return existing.rows[0];
   const workspace = await findWorkspacePanel(client, projectId, panelId, true);
   if (!workspace.exists) return null;
@@ -1283,11 +1421,11 @@ async function getPanelSettings(client, projectId, panelId, actorId) {
   const seeded = await client.query(
     `INSERT INTO app_panel_settings(project_id,panel_id,settings,saved_setting_files,updated_by)
      VALUES($1,$2,$3::jsonb,$4::jsonb,$5) ON CONFLICT(project_id,panel_id) DO NOTHING
-     RETURNING settings,saved_setting_files,updated_at`,
+     RETURNING settings,saved_setting_files,updated_at,revision`,
     [projectId, panelId, JSON.stringify(legacySettings), JSON.stringify(files), actorId],
   );
   if (seeded.rowCount) return seeded.rows[0];
-  const raced = await client.query("SELECT settings,saved_setting_files,updated_at FROM app_panel_settings WHERE project_id=$1 AND panel_id=$2", [projectId, panelId]);
+  const raced = await client.query("SELECT settings,saved_setting_files,updated_at,revision FROM app_panel_settings WHERE project_id=$1 AND panel_id=$2", [projectId, panelId]);
   return raced.rows[0] || null;
 }
 
@@ -1301,13 +1439,6 @@ function encryptPanelPassword(password) {
   const cipher = createCipheriv("aes-256-gcm", panelProfileKey, iv);
   const encrypted = Buffer.concat([cipher.update(password, "utf8"), cipher.final()]);
   return [iv, cipher.getAuthTag(), encrypted].map((part) => part.toString("base64url")).join(".");
-}
-function decryptPanelPassword(value) {
-  if (!panelProfileKey) throw new Error("Panel credential encryption is not configured");
-  const [iv, tag, encrypted] = String(value || "").split(".").map((part) => Buffer.from(part, "base64url"));
-  const decipher = createDecipheriv("aes-256-gcm", panelProfileKey, iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
 }
 let panelProfilesSchemaPromise;
 function ensurePanelProfilesSchema() {
@@ -1334,13 +1465,13 @@ app.get("/api/projects/:projectId/panels/:panelId/user-profiles", async (req, re
   if (!canAccessPanel(req.user, projectId, panelId)) return res.sendStatus(403);
   try {
     await ensurePanelProfilesSchema();
-    const panel = await pool.query("SELECT 1 FROM app_state CROSS JOIN LATERAL jsonb_array_elements(COALESCE(payload->'projects','[]'::jsonb)) AS p(project) CROSS JOIN LATERAL jsonb_array_elements(COALESCE(p.project->'panels','[]'::jsonb)) AS q(panel) WHERE workspace_key=$1 AND p.project->>'id'=$2 AND q.panel->>'id'=$3 LIMIT 1", [workspaceKey, projectId, panelId]);
-    if (!panel.rowCount) return res.sendStatus(404);
+    const panelExists = (await getWorkspaceProjects()).some((project) => String(project.id) === projectId && project.panels?.some((panel) => String(panel.id) === panelId));
+    if (!panelExists) return res.sendStatus(404);
     const result = await pool.query("SELECT user_slot,display_name,photo_data,password_ciphertext FROM app_panel_user_profiles WHERE project_id=$1 AND panel_id=$2 ORDER BY user_slot", [projectId, panelId]);
     res.set("Cache-Control", "no-store");
     return res.json({ ok: true, profiles: publicPanelProfiles(result.rows) });
   } catch (error) {
-    console.error("Panel user profiles read error:", error);
+    logServerError("Panel user profiles read error:", error);
     return res.status(503).json({ ok: false, error: "Could not load panel user profiles" });
   }
 });
@@ -1366,8 +1497,9 @@ app.put("/api/projects/:projectId/panels/:panelId/user-profiles", requireHttps, 
   try {
     await ensurePanelProfilesSchema();
     await client.query("BEGIN");
-    const panel = await client.query("SELECT 1 FROM app_state CROSS JOIN LATERAL jsonb_array_elements(COALESCE(payload->'projects','[]'::jsonb)) AS p(project) CROSS JOIN LATERAL jsonb_array_elements(COALESCE(p.project->'panels','[]'::jsonb)) AS q(panel) WHERE workspace_key=$1 AND p.project->>'id'=$2 AND q.panel->>'id'=$3 LIMIT 1", [workspaceKey, projectId, panelId]);
-    if (!panel.rowCount) { await client.query("ROLLBACK"); return res.sendStatus(404); }
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [workspaceKey]);
+    const panel = await findWorkspacePanel(client, projectId, panelId, true);
+    if (!panel.exists) { await client.query("ROLLBACK"); return res.sendStatus(404); }
     for (const profile of checked) {
       const existing = await client.query("SELECT password_ciphertext FROM app_panel_user_profiles WHERE project_id=$1 AND panel_id=$2 AND user_slot=$3", [projectId, panelId, profile.slot]);
       const passwordCiphertext = profile.password ? encryptPanelPassword(profile.password) : profile.clearPassword ? null : existing.rows[0]?.password_ciphertext || null;
@@ -1382,7 +1514,7 @@ app.put("/api/projects/:projectId/panels/:panelId/user-profiles", requireHttps, 
     return res.json({ ok: true, profiles: publicPanelProfiles(result.rows) });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Panel user profiles save error:", error);
+    logServerError("Panel user profiles save error:", error);
     return res.status(503).json({ ok: false, error: "Could not save panel user profiles" });
   } finally { client.release(); }
 });
@@ -1402,16 +1534,20 @@ app.get("/api/projects/:projectId/panels/:panelId/settings", async (req, res) =>
     const row = await getPanelSettings(client, projectId, panelId, req.user.id);
     await client.query("COMMIT");
     res.set("Cache-Control", "no-store");
-    return res.json({ ok: true, projectId, panelId, settings: row?.settings || {}, savedSettingFiles: row?.saved_setting_files || [], updatedAt: row?.updated_at || null });
+    const revision = Number(row?.revision || 1);
+    res.set("ETag", `"panel-${revision}"`);
+    return res.json({ ok: true, projectId, panelId, settings: row?.settings || {}, savedSettingFiles: row?.saved_setting_files || [], updatedAt: row?.updated_at || null, revision });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Panel settings read error:", error);
+    logServerError("Panel settings read error:", error);
     return res.status(503).json({ ok: false, error: "Could not load panel settings" });
   } finally { client.release(); }
 });
 
 app.put("/api/projects/:projectId/panels/:panelId/settings", async (req, res) => {
   const { projectId, panelId } = req.params;
+  const expectedRevision = readExpectedRevision(req);
+  if (expectedRevision === null) return res.status(428).json({ ok: false, error: "Panel settings version required. Reload the panel before saving." });
   if (!canAccessPanel(req.user, projectId, panelId)) {
     void writeAudit(pool, { actorId: req.user.id, action: "panel.settings.write", projectId, panelId, outcome: "denied" }).catch(() => {});
     return res.sendStatus(403);
@@ -1419,20 +1555,29 @@ app.put("/api/projects/:projectId/panels/:panelId/settings", async (req, res) =>
   const checked = validatePanelSettings(req.body?.settings);
   if (!checked.ok) return res.status(400).json({ ok: false, error: checked.error });
   if (!Array.isArray(req.body?.savedSettingFiles) || req.body.savedSettingFiles.length > 100) return res.status(400).json({ ok: false, error: "Invalid saved settings files" });
+  const fileLoopCardViolation = findLoopCardLimitViolation(req.body.savedSettingFiles, "savedSettingFiles");
+  if (fileLoopCardViolation) return res.status(400).json({ ok: false, error: "At most two loop cards are allowed", code: "LOOP_CARD_LIMIT_EXCEEDED", field: fileLoopCardViolation.path });
   const files = panelFilesFor(req.body.savedSettingFiles, panelId);
   if (Buffer.byteLength(JSON.stringify(files), "utf8") > 2_000_000) return res.status(413).json({ ok: false, error: "Saved settings files are too large" });
   const client = await pool.connect().catch(() => null);
   if (!client) return res.status(503).json({ ok: false, error: "Database unavailable" });
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [workspaceKey]);
     const panel = await findWorkspacePanel(client, projectId, panelId, true);
     if (!panel.exists) { await client.query("ROLLBACK"); return res.sendStatus(404); }
     const previous = await getPanelSettings(client, projectId, panelId, req.user.id);
+    const currentRevision = Number(previous?.revision || 0);
+    if (currentRevision !== expectedRevision) {
+      await client.query("ROLLBACK");
+      res.set("ETag", `"panel-${currentRevision}"`);
+      return res.status(409).json({ ok: false, code: "PANEL_VERSION_CONFLICT", error: "Panel settings changed since they were loaded", revision: currentRevision });
+    }
     const result = await client.query(
-      `INSERT INTO app_panel_settings(project_id,panel_id,settings,saved_setting_files,updated_by,updated_at)
-       VALUES($1,$2,$3::jsonb,$4::jsonb,$5,NOW())
-       ON CONFLICT(project_id,panel_id) DO UPDATE SET settings=EXCLUDED.settings,saved_setting_files=EXCLUDED.saved_setting_files,updated_by=EXCLUDED.updated_by,updated_at=NOW()
-       RETURNING updated_at`,
+      `INSERT INTO app_panel_settings(project_id,panel_id,settings,saved_setting_files,updated_by,revision,updated_at)
+       VALUES($1,$2,$3::jsonb,$4::jsonb,$5,1,NOW())
+       ON CONFLICT(project_id,panel_id) DO UPDATE SET settings=EXCLUDED.settings,saved_setting_files=EXCLUDED.saved_setting_files,updated_by=EXCLUDED.updated_by,revision=app_panel_settings.revision+1,updated_at=NOW()
+       RETURNING updated_at,revision`,
       [projectId, panelId, JSON.stringify(checked.settings), JSON.stringify(files), req.user.id],
     );
     const changedKeys = [...new Set([...Object.keys(previous?.settings || {}), ...Object.keys(checked.settings)])]
@@ -1448,10 +1593,13 @@ app.put("/api/projects/:projectId/panels/:panelId/settings", async (req, res) =>
       );
     }
     await client.query("COMMIT");
-    return res.json({ ok: true, projectId, panelId, updatedAt: result.rows[0].updated_at, settings: checked.settings, savedSettingFiles: files });
+    const revision = Number(result.rows[0].revision);
+    res.set("ETag", `"panel-${revision}"`);
+    res.set("Cache-Control", "no-store");
+    return res.json({ ok: true, projectId, panelId, updatedAt: result.rows[0].updated_at, revision, settings: checked.settings, savedSettingFiles: files });
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
-    console.error("Panel settings save error:", error);
+    logServerError("Panel settings save error:", error);
     await writeAudit(pool, { actorId: req.user.id, action: "panel.settings.saved", projectId, panelId, outcome: "failure", details: { reason: "storage_error" } }).catch(() => {});
     return res.status(503).json({ ok: false, error: "Could not save panel settings" });
   } finally { client.release(); }
@@ -1460,12 +1608,18 @@ app.put("/api/projects/:projectId/panels/:panelId/settings", async (req, res) =>
 app.get("/api/state", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT payload, updated_at FROM app_state WHERE workspace_key = $1",
+      "SELECT payload, updated_at, revision FROM app_state WHERE workspace_key = $1",
       [workspaceKey],
     );
-    if (!result.rowCount) return res.json({ workspaceKey, payload: null, updatedAt: null });
-    const payload = sanitizeWorkspaceForUser(result.rows[0].payload, req.user, { hasGlobalPermission, hasProjectPermission });
-    res.json({ workspaceKey, payload, updatedAt: result.rows[0].updated_at });
+    const projects = await loadWorkspaceProjects(pool, workspaceKey);
+    if (!result.rowCount) {
+      setWorkspaceRevision(res, 0);
+      return res.json({ workspaceKey, payload: projects.length ? { projects, state: {} } : null, updatedAt: null, version: 0 });
+    }
+    const payload = sanitizeWorkspaceForUser({ ...result.rows[0].payload, projects }, req.user, { hasGlobalPermission, hasProjectPermission });
+    const version = Number(result.rows[0].revision || 1);
+    setWorkspaceRevision(res, version);
+    res.json({ workspaceKey, payload, updatedAt: result.rows[0].updated_at, version });
   } catch (error) {
     res.status(503).json({ ok: false, error: process.env.NODE_ENV === "production" ? "Database unavailable" : error.message });
   }
@@ -1475,21 +1629,17 @@ app.get("/api/projects/:projectId/image", async (req, res) => {
   if (!canAccessProject(req.user, req.params.projectId)) return res.sendStatus(403);
   try {
     const result = await pool.query(
-      "SELECT payload FROM app_state WHERE workspace_key = $1",
-      [workspaceKey],
+      "SELECT i.mime_type,i.image_data FROM app_projects p JOIN app_project_images i ON i.workspace_key=p.workspace_key AND i.project_id=p.project_id AND i.image_id=p.project_data->>'coverImageId' WHERE p.workspace_key=$1 AND p.project_id=$2",
+      [workspaceKey, req.params.projectId],
     );
-    const project = result.rows[0]?.payload?.projects?.find((item) => item?.id === req.params.projectId);
-    const source = typeof project?.image === "string" ? project.image : "";
-    const match = source.match(/^data:image\/(png|jpeg|jpg|webp|gif|avif|bmp);base64,([A-Za-z0-9+/=]+)$/i);
-    if (!match) return res.sendStatus(404);
-
-    const contentType = match[1].toLowerCase() === "jpg" ? "image/jpeg" : `image/${match[1].toLowerCase()}`;
+    if (!result.rowCount) return res.sendStatus(404);
     res.set({
-      "Content-Type": contentType,
+      "Content-Type": `image/${result.rows[0].mime_type}`,
+      "Content-Length": String(result.rows[0].image_data.length),
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     });
-    return res.send(Buffer.from(match[2], "base64"));
+    return res.send(result.rows[0].image_data);
   } catch (error) {
     return res.status(503).json({ ok: false, error: process.env.NODE_ENV === "production" ? "Database unavailable" : error.message });
   }
@@ -1498,69 +1648,71 @@ app.get("/api/projects/:projectId/image", async (req, res) => {
 app.get("/api/projects/:projectId/images/:imageId", async (req, res) => {
   if (!canAccessProject(req.user, req.params.projectId)) return res.sendStatus(403);
   try {
-    const result = await pool.query("SELECT payload FROM app_state WHERE workspace_key = $1", [workspaceKey]);
-    const project = result.rows[0]?.payload?.projects?.find((item) => item?.id === req.params.projectId);
-    const gallery = Array.isArray(project?.images) ? project.images : [];
-    const image = gallery.find((item) => (typeof item === "string" ? `${project.id}-image-${gallery.indexOf(item) + 1}` : item?.id) === req.params.imageId);
-    const source = typeof image === "string" ? image : image?.src || "";
-    const match = source.match(/^data:image\/(png|jpeg|jpg|webp|gif|avif|bmp);base64,([A-Za-z0-9+/=]+)$/i);
-    if (!match) return res.sendStatus(404);
-    const contentType = match[1].toLowerCase() === "jpg" ? "image/jpeg" : `image/${match[1].toLowerCase()}`;
-    res.set({ "Content-Type": contentType, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
-    return res.send(Buffer.from(match[2], "base64"));
+    const result = await pool.query(
+      `SELECT i.mime_type,i.image_data FROM app_projects p
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(p.project_data->'images','[]'::jsonb)) AS gallery(item)
+       JOIN app_project_images i ON i.workspace_key=p.workspace_key AND i.project_id=p.project_id AND i.image_id=gallery.item->>'storedImageId'
+       WHERE p.workspace_key=$1 AND p.project_id=$2 AND gallery.item->>'id'=$3`,
+      [workspaceKey, req.params.projectId, req.params.imageId],
+    );
+    if (!result.rowCount) return res.sendStatus(404);
+    res.set({ "Content-Type": `image/${result.rows[0].mime_type}`, "Content-Length": String(result.rows[0].image_data.length), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+    return res.send(result.rows[0].image_data);
   } catch (error) {
     return res.status(503).json({ ok: false, error: process.env.NODE_ENV === "production" ? "Database unavailable" : error.message });
   }
 });
 
-const MAX_LOOP_CARDS_PER_PANEL = 2;
-
-function limitPersistedLoopCards(payload) {
-  const savedState = payload.state;
-  if (!savedState || typeof savedState !== "object" || Array.isArray(savedState)) return payload;
-  let changed = false;
-  const loopCards = savedState.loopCards;
-  const limitedLoopCards = Array.isArray(loopCards) ? loopCards.slice(0, MAX_LOOP_CARDS_PER_PANEL) : loopCards;
-  if (Array.isArray(loopCards) && limitedLoopCards.length !== loopCards.length) changed = true;
-
-  const savedSettingFiles = Array.isArray(savedState.savedSettingFiles)
-    ? savedState.savedSettingFiles.map((file) => {
-      const snapshotCards = file?.snapshot?.loopCards;
-      if (!Array.isArray(snapshotCards) || snapshotCards.length <= MAX_LOOP_CARDS_PER_PANEL) return file;
-      changed = true;
-      return { ...file, snapshot: { ...file.snapshot, loopCards: snapshotCards.slice(0, MAX_LOOP_CARDS_PER_PANEL) } };
-    })
-    : savedState.savedSettingFiles;
-
-  if (!changed) return payload;
-  return {
-    ...payload,
-    state: { ...savedState, loopCards: limitedLoopCards, savedSettingFiles },
-  };
-}
-
 const saveState = async (req, res) => {
   const incomingPayload = req.body?.payload;
-  const payload = incomingPayload && typeof incomingPayload === "object" && !Array.isArray(incomingPayload)
-    ? limitPersistedLoopCards(incomingPayload)
-    : incomingPayload;
+  const payload = incomingPayload;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return res.status(400).json({ ok: false, error: "payload must be a JSON object" });
   }
+  const expectedRevision = readExpectedRevision(req);
+  if (expectedRevision === null) return res.status(428).json({ ok: false, error: "Workspace version required. Reload the app before saving." });
+  const loopCardViolation = findLoopCardLimitViolation(payload);
+  if (loopCardViolation) return res.status(400).json({ ok: false, error: "At most two loop cards are allowed", code: "LOOP_CARD_LIMIT_EXCEEDED", field: loopCardViolation.path });
   if (!Array.isArray(payload.projects) || payload.projects.some((project) => !project || typeof project.id !== "string" || !project.id || !Array.isArray(project.panels))) {
     return res.status(400).json({ ok: false, error: "payload must include valid projects and panels" });
   }
+  try { payload.projects.forEach(splitProject); }
+  catch (error) { return res.status(400).json({ ok: false, error: error.message || "Invalid project image" }); }
   const projectIds = payload.projects.map((project) => project.id);
   if (new Set(projectIds).size !== projectIds.length) return res.status(400).json({ ok: false, error: "Project ids must be unique" });
 
+  const incomingPanelSettings = req.body?.panelSettings;
+  let checkedPanelSettings = null;
+  let incomingPanelFiles = null;
+  if (incomingPanelSettings !== undefined) {
+    if (!incomingPanelSettings || typeof incomingPanelSettings.projectId !== "string" || typeof incomingPanelSettings.panelId !== "string" || !Number.isSafeInteger(Number(incomingPanelSettings.revision)) || Number(incomingPanelSettings.revision) < 0) {
+      return res.status(400).json({ ok: false, error: "Invalid panel settings version or scope" });
+    }
+    checkedPanelSettings = validatePanelSettings(incomingPanelSettings.settings);
+    if (!checkedPanelSettings.ok) return res.status(400).json({ ok: false, error: checkedPanelSettings.error, code: checkedPanelSettings.code, field: checkedPanelSettings.field });
+    if (!Array.isArray(incomingPanelSettings.savedSettingFiles) || incomingPanelSettings.savedSettingFiles.length > 100) return res.status(400).json({ ok: false, error: "Invalid saved settings files" });
+    const fileViolation = findLoopCardLimitViolation(incomingPanelSettings.savedSettingFiles, "savedSettingFiles");
+    if (fileViolation) return res.status(400).json({ ok: false, error: "At most two loop cards are allowed", code: "LOOP_CARD_LIMIT_EXCEEDED", field: fileViolation.path });
+    incomingPanelFiles = panelFilesFor(incomingPanelSettings.savedSettingFiles, incomingPanelSettings.panelId);
+    if (Buffer.byteLength(JSON.stringify(incomingPanelFiles), "utf8") > 2_000_000) return res.status(413).json({ ok: false, error: "Saved settings files are too large" });
+  }
+
   if (!hasGlobalPermission(req.user, "projects:all") && !hasGlobalPermission(req.user, "projects:manage") && !hasGlobalPermission(req.user, "*") && hasGlobalPermission(req.user, "projects:create")) {
+    if (incomingPanelSettings) return res.status(403).json({ ok: false, error: "Project creation permission does not allow panel settings changes" });
     const client = await pool.connect().catch(() => null);
     if (!client) return res.status(503).json({ ok: false, error: "Database unavailable" });
     try {
       await client.query("BEGIN");
-      const current = await client.query("SELECT payload FROM app_state WHERE workspace_key=$1 FOR UPDATE", [workspaceKey]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [workspaceKey]);
+      const current = await client.query("SELECT payload,revision FROM app_state WHERE workspace_key=$1 FOR UPDATE", [workspaceKey]);
+      const currentRevision = Number(current.rows[0]?.revision || 0);
+      if (currentRevision !== expectedRevision) {
+        await client.query("ROLLBACK");
+        setWorkspaceRevision(res, currentRevision);
+        return res.status(409).json({ ok: false, code: "WORKSPACE_VERSION_CONFLICT", error: "Workspace changed since it was loaded", version: currentRevision });
+      }
       const existingPayload = current.rows[0]?.payload || { projects: [], state: {} };
-      const existingProjects = Array.isArray(existingPayload.projects) ? existingPayload.projects : [];
+      const existingProjects = await loadWorkspaceProjects(client, workspaceKey, { lock: true });
       if (!Array.isArray(payload.projects)) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: "Project list is required" }); }
       const existingById = new Map(existingProjects.map((project) => [String(project.id), project]));
       const additions = [];
@@ -1573,12 +1725,15 @@ const saveState = async (req, res) => {
         }
         seenProjectIds.add(id);
         if (existingById.has(id)) {
-          if (JSON.stringify(existingById.get(id)) !== JSON.stringify(project)) { await client.query("ROLLBACK"); return res.status(403).json({ ok: false, error: "Project creation permission does not allow editing existing projects" }); }
+          if (stableJson(existingById.get(id)) !== stableJson(project)) { await client.query("ROLLBACK"); return res.status(403).json({ ok: false, error: "Project creation permission does not allow editing existing projects" }); }
         } else additions.push(project);
       }
       if (!additions.length) { await client.query("ROLLBACK"); return res.status(403).json({ ok: false, error: "Project creation only accepts new projects" }); }
-      const nextPayload = { ...existingPayload, projects: [...existingProjects, ...additions] };
-      const saved = await client.query("INSERT INTO app_state(workspace_key,payload,updated_at) VALUES($1,$2::jsonb,NOW()) ON CONFLICT(workspace_key) DO UPDATE SET payload=EXCLUDED.payload,updated_at=NOW() RETURNING updated_at", [workspaceKey, JSON.stringify(nextPayload)]);
+      const nextProjects = [...existingProjects, ...additions];
+      const nextPayload = { ...existingPayload };
+      delete nextPayload.projects;
+      await saveWorkspaceProjects(client, workspaceKey, nextProjects);
+      const saved = await client.query("INSERT INTO app_state(workspace_key,payload,revision,updated_at) VALUES($1,$2::jsonb,1,NOW()) ON CONFLICT(workspace_key) DO UPDATE SET payload=EXCLUDED.payload,revision=app_state.revision+1,updated_at=NOW() RETURNING updated_at,revision", [workspaceKey, JSON.stringify(nextPayload)]);
       for (const project of additions) {
         await client.query("INSERT INTO app_user_projects(user_id,project_id,granted_by) VALUES($1,$2,$1) ON CONFLICT DO NOTHING", [req.user.id, String(project.id)]);
         await client.query("INSERT INTO app_user_project_permissions(user_id,project_id,permission,granted_by) VALUES($1,$2,'project:manage',$1) ON CONFLICT DO NOTHING", [req.user.id, String(project.id)]);
@@ -1586,8 +1741,9 @@ const saveState = async (req, res) => {
         await client.query("INSERT INTO app_audit_log(actor_user_id,action,project_id,details) VALUES($1,'project.created',$2,$3::jsonb)", [req.user.id, String(project.id), JSON.stringify({ name: String(project.name || "").slice(0,160) })]);
       }
       await client.query("COMMIT");
-      return res.json({ ok: true, workspaceKey, updatedAt: saved.rows[0].updated_at });
-    } catch (error) { await client.query("ROLLBACK").catch(() => {}); console.error("Scoped project create error:", error); return res.status(503).json({ ok: false, error: "Could not create project" }); }
+      setWorkspaceRevision(res, Number(saved.rows[0].revision));
+      return res.json({ ok: true, workspaceKey, updatedAt: saved.rows[0].updated_at, version: Number(saved.rows[0].revision) });
+    } catch (error) { await client.query("ROLLBACK").catch(() => {}); logServerError("Scoped project create error:", error); return res.status(503).json({ ok: false, error: "Could not create project" }); }
     finally { client.release(); }
   }
 
@@ -1600,6 +1756,7 @@ const saveState = async (req, res) => {
   }
 
   const workspacePayload = { ...payload, state: { ...(payload.state || {}) } };
+  delete workspacePayload.projects;
   for (const key of PANEL_SETTING_KEYS) delete workspacePayload.state[key];
   delete workspacePayload.state.savedSettingFiles;
 
@@ -1607,12 +1764,20 @@ const saveState = async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const previous = await client.query("SELECT payload FROM app_state WHERE workspace_key=$1 FOR UPDATE", [workspaceKey]);
-      const previousProjects = Array.isArray(previous.rows[0]?.payload?.projects) ? previous.rows[0].payload.projects : [];
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [workspaceKey]);
+      const previous = await client.query("SELECT payload,revision FROM app_state WHERE workspace_key=$1 FOR UPDATE", [workspaceKey]);
+      const currentRevision = Number(previous.rows[0]?.revision || 0);
+      if (currentRevision !== expectedRevision) {
+        await client.query("ROLLBACK");
+        setWorkspaceRevision(res, currentRevision);
+        return res.status(409).json({ ok: false, code: "WORKSPACE_VERSION_CONFLICT", error: "Workspace changed since it was loaded", version: currentRevision });
+      }
+      const previousProjects = await loadWorkspaceProjects(client, workspaceKey, { lock: true });
       const nextProjectIds = new Set(Array.isArray(payload.projects) ? payload.projects.map((project) => String(project.id)) : []);
       const removedProjectIds = previousProjects.map((project) => String(project.id)).filter((id) => !nextProjectIds.has(id));
+      await saveWorkspaceProjects(client, workspaceKey, payload.projects);
       const result = await client.query(
-        "INSERT INTO app_state (workspace_key, payload, updated_at) VALUES ($1, $2::jsonb, NOW()) ON CONFLICT (workspace_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW() RETURNING updated_at",
+        "INSERT INTO app_state (workspace_key, payload, revision, updated_at) VALUES ($1, $2::jsonb, 1, NOW()) ON CONFLICT (workspace_key) DO UPDATE SET payload = EXCLUDED.payload, revision=app_state.revision+1, updated_at = NOW() RETURNING updated_at,revision",
         [workspaceKey, JSON.stringify(workspacePayload)],
       );
       await client.query("INSERT INTO app_audit_log(actor_user_id,action,details) VALUES($1,'workspace.state_saved',$2::jsonb)", [req.user.id, JSON.stringify({ projectCount: nextProjectIds.size })]);
@@ -1621,8 +1786,31 @@ const saveState = async (req, res) => {
         await client.query("DELETE FROM app_user_projects WHERE project_id=$1", [projectId]);
         for (const membership of affected.rows) await client.query("INSERT INTO app_audit_log(actor_user_id,target_user_id,action,project_id,details) VALUES($1,$2,'project.access_revoked',$3,'{}'::jsonb)", [req.user.id, membership.user_id, projectId]);
       }
+      let panelSettingsRevision;
+      if (incomingPanelSettings) {
+        const { projectId, panelId } = incomingPanelSettings;
+        if (!payload.projects.some((project) => String(project.id) === projectId && project.panels.some((panel) => String(panel.id) === panelId))) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ ok: false, error: "Panel settings target does not exist" });
+        }
+        const previousPanelSettings = await getPanelSettings(client, projectId, panelId, req.user.id);
+        const currentPanelRevision = Number(previousPanelSettings?.revision || 0);
+        if (currentPanelRevision !== Number(incomingPanelSettings.revision)) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ ok: false, code: "PANEL_VERSION_CONFLICT", error: "Panel settings changed since they were loaded", revision: currentPanelRevision });
+        }
+        const savedPanel = await client.query(
+          `INSERT INTO app_panel_settings(project_id,panel_id,settings,saved_setting_files,updated_by,revision,updated_at)
+           VALUES($1,$2,$3::jsonb,$4::jsonb,$5,1,NOW())
+           ON CONFLICT(project_id,panel_id) DO UPDATE SET settings=EXCLUDED.settings,saved_setting_files=EXCLUDED.saved_setting_files,updated_by=EXCLUDED.updated_by,revision=app_panel_settings.revision+1,updated_at=NOW()
+           RETURNING revision`,
+          [projectId, panelId, JSON.stringify(checkedPanelSettings.settings), JSON.stringify(incomingPanelFiles), req.user.id],
+        );
+        panelSettingsRevision = Number(savedPanel.rows[0].revision);
+      }
       await client.query("COMMIT");
-      return res.json({ ok: true, workspaceKey, updatedAt: result.rows[0].updated_at });
+      setWorkspaceRevision(res, Number(result.rows[0].revision));
+      return res.json({ ok: true, workspaceKey, updatedAt: result.rows[0].updated_at, version: Number(result.rows[0].revision), ...(panelSettingsRevision ? { panelSettingsRevision } : {}) });
     } catch (error) { await client.query("ROLLBACK").catch(() => {}); throw error; }
     finally { client.release(); }
   } catch (error) {
@@ -1634,7 +1822,18 @@ app.put("/api/state", saveState);
 app.post("/api/state", saveState);
 
 if (existsSync(distDirectory)) {
-  app.use(express.static(distDirectory, { index: "index.html" }));
+  app.use(express.static(distDirectory, {
+    index: "index.html",
+    maxAge: "1y",
+    immutable: true,
+    setHeaders: (res, filePath) => {
+      const name = path.basename(filePath);
+      if (name === "index.html" || !/[.-][a-f0-9]{8,}\./i.test(name)) {
+        res.setHeader("Cache-Control", "no-cache");
+        res.removeHeader("Expires");
+      }
+    },
+  }));
   app.get(/^(?!\/api(?:\/|$)).*/, (req, res, next) => {
     if (req.method !== "GET" || !existsSync(distIndex)) return next();
     res.sendFile(distIndex, (error) => { if (error) next(error); });
@@ -1642,11 +1841,11 @@ if (existsSync(distDirectory)) {
 }
 
 const server = app.listen(port, "0.0.0.0", () => {
-  console.log("Monitoring API listening on port " + port);
+  logger.info("server.started", { port, dataDirectory, logDirectory });
 });
 
 const shutdown = async (signal) => {
-  console.log(signal + " received; shutting down gracefully.");
+  logger.info("server.shutdown", { signal });
   server.close(async () => {
     await pool.end();
     process.exit(0);

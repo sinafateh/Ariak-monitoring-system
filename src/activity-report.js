@@ -1,3 +1,5 @@
+import { apiFetch } from "./api-client.js";
+
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 
 const ACTIONS = {
@@ -49,6 +51,7 @@ let currentFilters = {};
 let filterTimer;
 
 const tx = (persian, english, language) => language === "en" ? english : persian;
+const countText = (count, language) => `${Number(count).toLocaleString(language === "en" ? "en-US" : "fa-IR-u-nu-latn")} ${language === "en" ? Number(count) === 1 ? "event" : "events" : "رویداد"}`;
 const notify = (message, tone = "success") => window.dispatchEvent(new CustomEvent("app:toast", { detail: { message, tone } }));
 const actionLabel = (action, language) => ACTIONS[action] ? tx(ACTIONS[action][0], ACTIONS[action][1], language) : action || tx("عملیات نامشخص", "Unknown action", language);
 const actionCategory = (action) => ACTIONS[action]?.[2] || "other";
@@ -77,7 +80,7 @@ const printable = (value) => typeof value === "string" ? value : JSON.stringify(
 async function requestReport(filters = {}, page = 1, pageSize = report.pageSize || 25) {
   const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
   for (const [key, value] of Object.entries(filters)) if (value) params.set(key, value);
-  const response = await fetch(`/api/audit?${params}`, { cache: "no-store" });
+  const response = await apiFetch(`/api/audit?${params}`, { cache: "no-store" });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
@@ -176,7 +179,7 @@ export function renderActivityReport(language = "fa") {
       </form>${errorNotice}</section>
     <section class="section-card activity-events-card"><div class="section-heading"><div><h2>${tx("رویدادهای ثبت‌شده", "Recorded events", language)}</h2><p class="section-subtitle">${Number(report.total || 0).toLocaleString(language === "en" ? "en-US" : "fa-IR-u-nu-latn")} ${tx("نتیجه مطابق فیلترهای انتخاب‌شده", "results match the selected filters", language)}</p></div><span class="results-count">${pageText} ${page} ${tx("از", "of", language)} ${pages}</span></div>
       <div class="activity-list">${events.length ? events.map((event) => renderEvent(event, language)).join("") : renderEmptyState(language)}</div>
-      ${report.total > report.pageSize ? `<footer class="activity-pagination"><span>${Number(report.total).toLocaleString(language === "en" ? "en-US" : "fa-IR-u-nu-latn")} ${tx("رویداد", "events", language)} · ${pageText} ${page} ${tx("از", "of", language)} ${pages}</span><div><button class="btn btn-secondary btn-small" type="button" data-activity-page="prev" ${page <= 1 ? "disabled" : ""}>${tx("قبلی", "Previous", language)}</button><button class="btn btn-secondary btn-small" type="button" data-activity-page="next" ${page >= pages ? "disabled" : ""}>${tx("بعدی", "Next", language)}</button></div></footer>` : ""}
+      ${report.total > report.pageSize ? `<footer class="activity-pagination"><span>${countText(report.total, language)} · ${pageText} ${page} ${tx("از", "of", language)} ${pages}</span><div><button class="btn btn-secondary btn-small" type="button" data-activity-page="prev" ${page <= 1 ? "disabled" : ""}>${tx("قبلی", "Previous", language)}</button><button class="btn btn-secondary btn-small" type="button" data-activity-page="next" ${page >= pages ? "disabled" : ""}>${tx("بعدی", "Next", language)}</button></div></footer>` : ""}
     </section>
     <aside class="access-intro"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg><div><strong>${tx("گزارش فعالیت با رویدادهای حریق متفاوت است", "Activity reports are separate from fire events", language)}</strong><p>${tx("این بخش اقدام کاربران و مدیران را ثبت می‌کند. آلارم حریق و خطای واقعی تجهیزات در بخش رویدادهای پنل‌ها نمایش داده می‌شوند.", "This page records actions by users and administrators. Fire alarms and equipment faults appear under panel events.", language)}</p></div></aside>
   </section>`;

@@ -54,7 +54,7 @@ try {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const lock = await client.query("SELECT pg_advisory_xact_lock(hashtext('monitoring-first-admin'))");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('monitoring-first-admin'))");
     const count = await client.query("SELECT COUNT(*)::int AS count FROM app_users");
     if (count.rows[0].count !== 0) throw new Error("An account was created while bootstrap was running.");
     await client.query("INSERT INTO app_users(id,username,username_normalized,password_hash,display_name) VALUES($1,$2,$3,$4,$5)", [id, username, normalizeUsername(username), passwordHash, displayName]);

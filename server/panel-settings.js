@@ -1,3 +1,5 @@
+import { findLoopCardLimitViolation } from "../shared/domain-constraints.js";
+
 export const PANEL_SETTING_KEYS = [
   "year", "month", "day", "hour", "minute", "dailyDayNightEnabled", "nightStartHour", "nightStartMinute", "nightEndHour", "nightEndMinute",
   "weekendEnabled", "weekendDay1", "weekendDay2", "holidayEnabled", "holidayYear", "holidayMonth", "holidayDay", "holidayDates",
@@ -12,7 +14,8 @@ export function validatePanelSettings(settings) {
   const keys = Object.keys(settings);
   if (keys.some((key) => !PANEL_SETTING_KEYS.includes(key))) return { ok: false, error: "Unknown or protected setting field" };
   if (Buffer.byteLength(JSON.stringify(settings), "utf8") > 1_000_000) return { ok: false, error: "Settings are too large" };
-  if (settings.loopCards !== undefined && (!Array.isArray(settings.loopCards) || settings.loopCards.length > 2)) return { ok: false, error: "At most two loop cards are allowed" };
+  const loopCardViolation = findLoopCardLimitViolation(settings, "settings");
+  if (loopCardViolation) return { ok: false, error: "At most two loop cards are allowed", code: "LOOP_CARD_LIMIT_EXCEEDED", field: loopCardViolation.path };
   if (settings.language !== undefined && !["fa", "en"].includes(settings.language)) return { ok: false, error: "Invalid language" };
   return { ok: true, settings: clone(settings) };
 }

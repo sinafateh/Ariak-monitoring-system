@@ -17,12 +17,23 @@ CREATE TABLE IF NOT EXISTS app_users (
 CREATE TABLE IF NOT EXISTS app_sessions (
   token_hash TEXT PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+  csrf_token_hash TEXT,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE app_sessions ADD COLUMN IF NOT EXISTS csrf_token_hash TEXT;
 CREATE INDEX IF NOT EXISTS app_sessions_user_id_idx ON app_sessions(user_id);
 CREATE INDEX IF NOT EXISTS app_sessions_expiry_idx ON app_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS app_login_rate_limits (
+  ip_hash TEXT PRIMARY KEY CHECK (length(ip_hash) = 64),
+  failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+  window_expires_at TIMESTAMPTZ NOT NULL,
+  blocked_until TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS app_login_rate_limits_expiry_idx ON app_login_rate_limits(window_expires_at, blocked_until);
 
 CREATE TABLE IF NOT EXISTS app_user_global_permissions (
   user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -80,8 +91,10 @@ CREATE TABLE IF NOT EXISTS app_panel_settings (
   settings JSONB NOT NULL DEFAULT '{}'::jsonb,
   saved_setting_files JSONB NOT NULL DEFAULT '[]'::jsonb,
   updated_by UUID REFERENCES app_users(id) ON DELETE SET NULL,
+  revision BIGINT NOT NULL DEFAULT 1,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY(project_id, panel_id)
 );
+ALTER TABLE app_panel_settings ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 
 DELETE FROM app_sessions WHERE expires_at <= NOW();

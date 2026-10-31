@@ -3,6 +3,7 @@ import * as pdfjs from "pdfjs-dist/build/pdf.mjs";
 import { addressToBinary, addressToBits, bitsToAddress, validateDeviceAddress } from "./dip-address.js";
 import { mountDipSwitch } from "./dip-switch.js";
 import "./floor-plan.css";
+import { apiFetch } from "./api-client.js";
 
 // PDF.js worker is bundled by Vite so page rendering remains local to the browser.
 pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).href;
@@ -13,7 +14,7 @@ const kinds = [
   { type: "FACP", en: "Fire Alarm Control Panel", fa: "پنل اعلام حریق" },
 ];
 const request = async (url, options = {}) => {
-  const response = await fetch(url, options);
+  const response = await apiFetch(url, options);
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
     try { message = (await response.json()).error || message; } catch { /* Keep HTTP fallback. */ }
@@ -46,7 +47,7 @@ export async function mountFloorPlanModule(root, options = {}) {
   const words = isEnglish ? {
     deviceSettings: "DEVICE SETTINGS", title: "Floor Plan Layout", intro: "Choose a project and panel, map its registered devices, and export the stamped original.",
     upload: "Upload floor plan", save: "Save Layout", export: "Export PDF", deletePlan: "Delete plan", confirmDeletePlan: "Delete this floor plan and all its device layouts? This cannot be undone.", deletedPlan: "Floor plan and layouts deleted.", floorPlan: "Floor plan", choosePlan: "Select a floor plan…", page: "Page",
-    choosePdf: "Choose a project and panel, then upload a PDF floor plan.", choosePlanBeforePlace: "Select or upload this project's floor plan first.", project: "Project", panel: "Panel", chooseProject: "Select a project…", choosePanel: "Select a panel…", devicesAvailable: "registered devices available", noDevices: "No saved device registry is available for this panel. Save this panel's device settings first.", lockedProject: "Project is fixed for this floor plan.", toolbox: "Devices for selected panel", dragTip: "Select a device to view its details; drag it onto the plan to place it.", snap: "Snap to grid",
+    choosePdf: "Choose a project and panel, then upload a PDF floor plan.", canvasEmptyTitle: "No floor plan is displayed", canvasEmptyText: "Select a saved plan or upload a PDF to arrange devices on the floor plan.", choosePlanBeforePlace: "Select or upload this project's floor plan first.", project: "Project", panel: "Panel", chooseProject: "Select a project…", choosePanel: "Select a panel…", devicesAvailable: "registered devices available", noDevices: "No saved device registry is available for this panel. Save this panel's device settings first.", lockedProject: "Project is fixed for this floor plan.", toolbox: "Devices for selected panel", dragTip: "Select a device to view its details; drag it onto the plan to place it.", snap: "Snap to grid",
     snapHint: "Shows alignment guides and snaps markers to a 10 pt grid. The guides are not exported.",
     selected: "Selected device", deviceType: "Device type", registered: "Registered device", manual: "Enter metadata manually", deviceId: "Device ID (optional)", enterId: "Enter ID",
     loop: "Loop card", address: "Device address", addressHint: "D024", zone: "Zone", label: "Label", labelHint: "e.g. L1-D024",
@@ -61,7 +62,7 @@ export async function mountFloorPlanModule(root, options = {}) {
   } : {
     deviceSettings: "تنظیمات دیوایس‌ها", title: "نقشه و چیدمان دیوایس‌ها", intro: "پروژه و پنل را انتخاب کنید، دیوایس‌های ثبت‌شدهٔ آن را جانمایی و نسخهٔ اصلی را خروجی بگیرید.",
     upload: "بارگذاری نقشه", save: "ذخیرهٔ چیدمان", export: "خروجی PDF", deletePlan: "حذف نقشه", confirmDeletePlan: "این نقشه و همهٔ چیدمان‌های دیوایس آن حذف شود؟ این کار بازگشت‌پذیر نیست.", deletedPlan: "نقشه و چیدمان‌های آن حذف شدند.", floorPlan: "نقشهٔ طبقه", choosePlan: "انتخاب نقشه…", page: "صفحه",
-    choosePdf: "ابتدا پروژه و پنل را انتخاب و سپس نقشهٔ PDF را بارگذاری کنید.", choosePlanBeforePlace: "ابتدا نقشهٔ این پروژه را انتخاب یا بارگذاری کنید.", project: "پروژه", panel: "پنل", chooseProject: "انتخاب پروژه…", choosePanel: "انتخاب پنل…", devicesAvailable: "دیوایس ثبت‌شده در دسترس", noDevices: "برای این پنل فهرست دیوایس ثبت‌شده‌ای پیدا نشد؛ ابتدا تنظیمات دیوایس‌های پنل را ذخیره کنید.", lockedProject: "پروژهٔ این پلان ثابت است.", toolbox: "دیوایس‌های پنل انتخاب‌شده", dragTip: "\u0628\u0631\u0627\u06cc \u0645\u0634\u0627\u0647\u062f\u0647\u0654 \u0645\u0634\u062e\u0635\u0627\u062a \u0631\u0648\u06cc \u062f\u06cc\u0648\u0627\u06cc\u0633 \u06a9\u0644\u06cc\u06a9 \u06a9\u0646\u06cc\u062f\u061b \u0628\u0631\u0627\u06cc \u0686\u06cc\u062f\u0646 \u0622\u0646 \u0631\u0627 \u0628\u06a9\u0634\u06cc\u062f \u0648 \u0631\u0648\u06cc \u0646\u0642\u0634\u0647 \u0631\u0647\u0627 \u06a9\u0646\u06cc\u062f.", snap: "خطوط راهنما",
+    choosePdf: "ابتدا پروژه و پنل را انتخاب و سپس نقشهٔ PDF را بارگذاری کنید.", canvasEmptyTitle: "نقشهٔ طبقه‌ای نمایش داده نمی‌شود", canvasEmptyText: "یک نقشهٔ ذخیره‌شده را انتخاب کنید یا فایل PDF طبقه را بارگذاری کنید تا جانمایی دیوایس‌ها را آغاز کنید.", choosePlanBeforePlace: "ابتدا نقشهٔ این پروژه را انتخاب یا بارگذاری کنید.", project: "پروژه", panel: "پنل", chooseProject: "انتخاب پروژه…", choosePanel: "انتخاب پنل…", devicesAvailable: "دیوایس ثبت‌شده در دسترس", noDevices: "برای این پنل فهرست دیوایس ثبت‌شده‌ای پیدا نشد؛ ابتدا تنظیمات دیوایس‌های پنل را ذخیره کنید.", lockedProject: "پروژهٔ این پلان ثابت است.", toolbox: "دیوایس‌های پنل انتخاب‌شده", dragTip: "\u0628\u0631\u0627\u06cc \u0645\u0634\u0627\u0647\u062f\u0647\u0654 \u0645\u0634\u062e\u0635\u0627\u062a \u0631\u0648\u06cc \u062f\u06cc\u0648\u0627\u06cc\u0633 \u06a9\u0644\u06cc\u06a9 \u06a9\u0646\u06cc\u062f\u061b \u0628\u0631\u0627\u06cc \u0686\u06cc\u062f\u0646 \u0622\u0646 \u0631\u0627 \u0628\u06a9\u0634\u06cc\u062f \u0648 \u0631\u0648\u06cc \u0646\u0642\u0634\u0647 \u0631\u0647\u0627 \u06a9\u0646\u06cc\u062f.", snap: "خطوط راهنما",
     snapHint: "خطوط راهنما را نشان می‌دهد و نمادها را روی شبکهٔ ۱۰ پوینتی می‌چسباند؛ خطوط در PDF خروجی چاپ نمی‌شوند.",
     selected: "دیوایس انتخاب‌شده", deviceType: "نوع دیوایس", registered: "دیوایس ثبت‌شده", manual: "ورود دستی مشخصات", deviceId: "شناسهٔ دیوایس (اختیاری)", enterId: "شناسه را وارد کنید",
     loop: "کارت لوپ", address: "آدرس دیوایس", addressHint: "D024", zone: "زون", label: "برچسب", labelHint: "مثلاً L1-D024",
@@ -158,7 +159,7 @@ export async function mountFloorPlanModule(root, options = {}) {
           <div class="fp-snap-control"><label class="fp-check"><input id="fp-snap" type="checkbox"> ${t("snap")}</label><small>${t("snapHint")}</small></div>
           <div class="fp-inspector"><h3>${t("selected")}</h3><label>${t("deviceType")}<input id="fp-type" type="text" readonly disabled></label><label>${t("loop")}<input id="fp-loop" type="text" readonly disabled></label><label>${t("address")}<input id="fp-address" type="number" min="1" max="254" step="1" inputmode="numeric" dir="ltr" placeholder="${t("addressHint")}" disabled></label><div id="fp-dip-switch" class="fp-dip-switch" aria-label="8-bit device address switch"></div><div class="fp-binary-row"><span>${isEnglish ? "Binary address" : "\u0622\u062f\u0631\u0633 \u062f\u0648\u062f\u0648\u0626\u06cc"}</span><output id="fp-binary" dir="ltr">00000000</output></div><small id="fp-address-status" class="fp-address-status" role="status"></small><div class="fp-inspector-actions"><button id="fp-apply" class="fp-button fp-button-primary" disabled>${isEnglish ? "Save address" : "\u0630\u062e\u06cc\u0631\u0647 \u0622\u062f\u0631\u0633"}</button><button id="fp-address-cancel" class="fp-button" disabled>${isEnglish ? "Cancel" : "\u0627\u0646\u0635\u0631\u0627\u0641"}</button><button id="fp-rotate" class="fp-button" disabled>${t("rotate")}</button><button id="fp-delete" class="fp-button fp-danger" disabled>${t("remove")}</button></div></div>
         </aside>
-        <section class="fp-canvas-panel"><div class="fp-canvas-tools"><button id="fp-fit" class="fp-button" disabled>${t("fit")}</button><button id="fp-add-device" class="fp-button fp-add-device-button" type="button" disabled><span aria-hidden="true">＋</span>${t("addDevice")}</button><span>${t("canvasHelp")}</span></div><div class="fp-canvas-scroll"><div class="fp-canvas-holder"><canvas id="fp-canvas"></canvas></div></div></section>
+        <section class="fp-canvas-panel"><div class="fp-canvas-tools"><button id="fp-fit" class="fp-button" disabled>${t("fit")}</button><button id="fp-add-device" class="fp-button fp-add-device-button" type="button" disabled><span aria-hidden="true">＋</span>${t("addDevice")}</button><span>${t("canvasHelp")}</span></div><div class="fp-canvas-scroll"><div class="fp-canvas-holder" data-empty="true"><div class="fp-canvas-empty-state" role="status" aria-live="polite"><span class="fp-canvas-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h4M8 16h8"/></svg></span><strong>${t("canvasEmptyTitle")}</strong><span>${t("canvasEmptyText")}</span></div><canvas id="fp-canvas"></canvas></div></div></section>
       </div>
     </div>`;
   root.innerHTML = html;
@@ -281,6 +282,10 @@ export async function mountFloorPlanModule(root, options = {}) {
     canvas?.dispose(); canvas = null;
     currentBackground = null;
     snapGridLines = [];
+    const holder = $(".fp-canvas-holder");
+    holder.dataset.empty = "true";
+    holder.style.removeProperty("width");
+    holder.style.removeProperty("height");
   };
   const clearPlan = () => { clearCanvas(); pdfDocument = null; };
   let addDeviceModal = null;
@@ -317,7 +322,7 @@ export async function mountFloorPlanModule(root, options = {}) {
         : (changed ? (isEnglish ? "Unsaved changes" : "\u062a\u063a\u06cc\u06cc\u0631\u0627\u062a \u0630\u062e\u06cc\u0631\u0647 \u0646\u0634\u062f\u0647") : "");
       $("#fp-apply").disabled = !validForDevice || !changed;
       $("#fp-address-cancel").disabled = !changed;
-    } catch (error) {
+    } catch {
       $("#fp-address-status").textContent = isEnglish ? "Enter an 8-bit address (1–254 to save)." : "\u0622\u062f\u0631\u0633 \u0628\u0627\u06cc\u062f \u06cc\u06a9 \u0639\u062f\u062f ۸ \u0628\u06cc\u062a\u06cc \u0628\u0627\u0634\u062f (\u0628\u0631\u0627\u06cc \u0630\u062e\u06cc\u0631\u0647 ۱ \u062a\u0627 ۲۵۴).";
       $("#fp-apply").disabled = true;
       $("#fp-address-cancel").disabled = originalAddress === null;
@@ -371,16 +376,26 @@ export async function mountFloorPlanModule(root, options = {}) {
     updateDeviceChoices();
   };
   const loadDeviceSymbol = async (iconUrl) => {
-    const response = await fetch(iconUrl);
+    const response = await apiFetch(iconUrl);
     if (!response.ok) throw new Error(`Could not load device symbol (${response.status})`);
+    const contentType = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    const iconPath = new URL(iconUrl, window.location.href).pathname;
+    const isSvg = contentType === "image/svg+xml" || /\.svg$/i.test(iconPath);
+    if (!isSvg) {
+      if (!contentType.startsWith("image/")) throw new Error("The device symbol image is invalid");
+      const objectUrl = URL.createObjectURL(await response.blob());
+      try { return await FabricImage.fromURL(objectUrl); }
+      finally { URL.revokeObjectURL(objectUrl); }
+    }
     const source = await response.text();
+    const openingTag = source.match(/<svg\b([^>]*)>/i);
+    if (!openingTag) throw new Error("The device symbol SVG is invalid");
     const normalizedSvg = source.replace(/<svg\b([^>]*)>/i, (_tag, attributes) => {
       // SVGs without explicit dimensions default to a 300x150 image viewport in
       // Fabric. Give them a square viewport so the full symbol stays visible.
       const viewAttributes = attributes.replace(/\s+(?:width|height|preserveAspectRatio)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
       return `<svg${viewAttributes} width="32" height="32" preserveAspectRatio="xMidYMid meet">`;
     });
-    if (normalizedSvg === source) throw new Error("The device symbol SVG is invalid");
     const objectUrl = URL.createObjectURL(new Blob([normalizedSvg], { type: "image/svg+xml" }));
     try { return await FabricImage.fromURL(objectUrl); }
     finally { URL.revokeObjectURL(objectUrl); }
@@ -575,6 +590,7 @@ export async function mountFloorPlanModule(root, options = {}) {
     window.addEventListener("mouseup", returnDeviceToList);
     canvasCleanups.push(() => { window.removeEventListener("keydown", keyDown); window.removeEventListener("keyup", keyUp); window.removeEventListener("blur", resetSpacePan); window.removeEventListener("pointermove", updateReturnPreview); window.removeEventListener("pointerup", returnDeviceToList); window.removeEventListener("mouseup", returnDeviceToList); deviceList.classList.remove("is-drop-target"); draggedDeviceMarker = null; });
     canvas.requestRenderAll();
+    $(".fp-canvas-holder").dataset.empty = "false";
     const fit = Math.min($(".fp-canvas-scroll").clientWidth / canvas.getWidth(), $(".fp-canvas-scroll").clientHeight / canvas.getHeight(), 1);
     canvas.setZoom(Math.max(0.12, fit));
     updateDeviceChoices(); setSelected(null); setUiState();
@@ -592,7 +608,7 @@ export async function mountFloorPlanModule(root, options = {}) {
       status(t("choosePdf"), true);
       return;
     }
-    if (selectedPlanId !== id) planLayouts = null;
+    if (selectedPlan?.id !== id) planLayouts = null;
     selectedPlanId = id;
     selectedPlan = nextPlan;
     clearPlan(); canvas = null;
@@ -617,6 +633,7 @@ export async function mountFloorPlanModule(root, options = {}) {
       await renderPage(); status(t("planStatus")(activePlan.name, activePlan.pageCount));
     } catch (error) {
       clearPlan(); canvas = null; selectedPlan = null;
+      selectedPlanId = ""; planLayouts = null; pageNumber = 1;
       $("#fp-page").replaceChildren();
       updatePlanChoices(); updateDeviceChoices();
       const message = error.message === "Request failed (404)" && !nextPlan.projectId ? t("apiOutdated") : translateError(error.message);
@@ -679,9 +696,11 @@ export async function mountFloorPlanModule(root, options = {}) {
       const form = new FormData(); form.append("pdf", file); form.append("name", file.name.replace(/\.pdf$/i, "")); form.append("projectId", selectedProjectId);
       const response = await request("/api/floor-plans", { method: "POST", body: form });
       const { plan } = await response.json();
+      selectedPlan = null; selectedPlanId = ""; planLayouts = null; pageNumber = 1;
+      selectedToolDevice = null; returnPreviewKey = ""; layoutDirty = false;
+      clearPlan(); $("#fp-page").replaceChildren();
       await refreshPlans();
       isBusy = false;
-      selectedPlanId = plan.id;
       $("#fp-plan-select").value = plan.id;
       await loadPlan(plan.id);
     } catch (error) { status(translateError(error.message), true); }

@@ -48,8 +48,16 @@
 .fp-canvas-scroll { height: min(72vh, 850px); min-height: 440px; overflow: auto; padding: 12px; background: #E9F2FB; }
 .fp-canvas-holder { margin: 0 auto; box-shadow: 0 3px 18px #17324D2b; background: white; direction: ltr; }
 .fp-canvas-holder canvas { display: block; }
+.fp-canvas-holder[data-empty="true"] { display: grid; place-items: center; width: min(100%, 930px); min-height: clamp(260px, 38vh, 360px); padding: 24px; border: 1px dashed var(--border); border-radius: 14px; background: linear-gradient(145deg, var(--surface), var(--surface-subtle)); direction: rtl; box-shadow: none; }
+.fp-canvas-holder[data-empty="true"] canvas { display: none; }
+.fp-canvas-holder[data-empty="false"] .fp-canvas-empty-state { display: none; }
+.fp-canvas-empty-state { display: grid; justify-items: center; gap: 10px; max-width: 440px; color: var(--text-main); text-align: center; }
+.fp-canvas-empty-icon { display: grid; place-items: center; width: 48px; height: 48px; color: var(--brand-accent); background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 14px; }
+.fp-canvas-empty-icon svg { width: 23px; height: 23px; }
+.fp-canvas-empty-state strong { font-size: 14px; }
+.fp-canvas-empty-state > span:last-child { color: var(--text-muted); font-size: 12px; line-height: 1.8; }
 @media (max-width: 900px) { .fp-workspace { grid-template-columns: 1fr; } .fp-toolbox { order: -1; } .fp-canvas-panel { order: 0; } .fp-device-list { grid-template-columns: repeat(2,minmax(0,1fr)); } .fp-inspector { grid-template-columns: repeat(2,minmax(0,1fr)); } .fp-inspector h3, .fp-inspector-actions { grid-column: 1/-1; } }
-@media (max-width: 600px) { .floor-plan-header { display: grid; } .fp-plan-bar { flex-wrap: wrap; } #fp-status { margin: 0; width: 100%; } .fp-device-list { grid-template-columns: 1fr; } .fp-inspector { grid-template-columns: 1fr; } .fp-canvas-scroll { min-height: 360px; } }
+@media (max-width: 600px) { .floor-plan-header { display: grid; } .fp-plan-bar { flex-wrap: wrap; } #fp-status { margin: 0; width: 100%; } .fp-device-list { grid-template-columns: 1fr; } .fp-inspector { grid-template-columns: 1fr; } .fp-canvas-scroll { min-height: 360px; } .fp-canvas-holder[data-empty="true"] { min-height: clamp(220px, 32vh, 300px); padding: 18px 14px; } }
 
 
 /* Floor plan colors follow the application's theme tokens. */
